@@ -132,13 +132,15 @@ def iter_records(trail_dir, sub="calls", since=None, until=None):
                     continue
 
 def parse_since(s):
-    """'7d', '12h', '2026-09-01' -> ISO local datetime string."""
+    """'10m', '12h', '7d', '2w' or '2026-09-01' -> ISO local datetime string."""
+    if s and not re.fullmatch(r"\d+[mdhw]|\d{4}-\d{2}-\d{2}.*", s):
+        raise SystemExit(f"docket: --since wants 10m, 12h, 7d, 2w or a date, not {s!r}")
     if not s:
         return None
-    m = re.fullmatch(r"(\d+)([dhw])", s)
+    m = re.fullmatch(r"(\d+)([mdhw])", s)
     if m:
         n, u = int(m.group(1)), m.group(2)
-        delta = {"d": datetime.timedelta(days=n), "h": datetime.timedelta(hours=n),
-                 "w": datetime.timedelta(weeks=n)}[u]
+        delta = {"m": datetime.timedelta(minutes=n), "d": datetime.timedelta(days=n),
+                 "h": datetime.timedelta(hours=n), "w": datetime.timedelta(weeks=n)}[u]
         return (datetime.datetime.now().astimezone() - delta).isoformat(timespec="seconds")
     return s

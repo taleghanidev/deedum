@@ -161,6 +161,8 @@ class Recorder:
                 self.reads += 1
 
     def finish(self, exit_code=None, started=None):
+        if self.reads + self.writes == 0 and os.environ.get("DOCKET_RUN") in (None, "always"):
+            return None  # a process that made no calls leaves no run line (always-on mode would flood runs/)
         rec = {"run": self.run, "argv": self.argv, "cwd": self.cwd, "why": self.why,
                "started": started, "ended": store.now_iso(), "reads": self.reads,
                "writes": self.writes, "exit": exit_code}
