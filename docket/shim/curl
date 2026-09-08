@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""curl shim installed on PATH by `docket run`: records the request and response, then behaves
+exactly like the real curl (same stdout, stderr and exit code)."""
+import os, sys, subprocess, tempfile, shlex, time
+_pkg = os.environ.get("DOCKET_PKG")
+if _pkg and _pkg not in sys.path:
+    sys.path.insert(0, _pkg)
+
+def real_curl():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if not p or os.path.abspath(p) == here:
+            continue
+        c = os.path.join(p, "curl")
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "/usr/bin/curl"
+
+DATA_FLAGS = {"-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode", "--json"}
+ONE_ARG = DATA_FLAGS | {"-X", "--request", "-H", "--header", "-F", "--form", "--form-string", "-o", "--output",
+    "-T", "--upload-file", "--url", "-u", "--user", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie",
+    "-c", "--cookie-jar", "-D", "--dump-header", "-w", "--write-out", "-m", "--max-time", "--connect-timeout",
+    "-x", "--proxy", "--retry", "-K", "--config", "--cacert", "--cert", "--key", "-r", "--range", "-y", "-Y",
+    "--limit-rate", "-z", "--time-cond", "--resolve", "--interface", "--proto", "--tlsv1.2", "--ciphers",
+    "--stderr", "--trace", "--trace-ascii", "--unix-socket", "--abstract-unix-socket", "--oauth2-bearer",
+    "--aws-sigv4", "--variable", "--expand-url", "-Q", "--quote", "--request-target", "--output-dir"}
+
+def parse(argv):
+    method = None; data = []; headers = {}; url = None; out = None; get = False; head = False; upload = None; form = []
+    i = 0
+    def val(flag):
+        nonlocal i
+        if "=" in flag and flag.startswith("--"):
+            return flag.split("=", 1)[1]
+        i += 1
+        return argv[i] if i < len(argv) else ""
+    while i < len(argv):
+        a = argv[i]
+        base = a.split("=", 1)[0] if a.startswith("--") else a
+        if base in ("-X", "--request"): method = val(a).upper()
+        elif base in DATA_FLAGS:
+            v = val(a)
+            if base != "--data-raw" and v.startswith("@"):
+                try: v = open(v[1:], "rb").read().decode("utf-8", "replace")
+                except Exception: pass
+            data.append(v)
+            if base == "--json": headers.setdefault("Content-Type", "application/json")
+        elif base in ("-H", "--header"):
+            h = val(a)
+            if ":" in h:
+                k, v = h.split(":", 1); headers[k.strip()] = v.strip()
+        elif base in ("-F", "--form", "--form-string"): form.append(val(a))
+        elif base in ("-o", "--output"): out = val(a)
+        elif base in ("-T", "--upload-file"): upload = val(a)
+        elif base in ("-G", "--get"): get = True
+        elif base in ("-I", "--head"): head = True
+        elif base == "--url": url = val(a)
+        elif base in ONE_ARG: val(a)
+        elif a.startswith("-") and len(a) > 1:
+            # bundled short flags like -sS or -sSL; -d/-H/-X/-o inside a bundle take the rest as value
+            for j, ch in enumerate(a[1:]):
+                if ch in "dHXoTFuAebcDwmxzrKyYQ":
+                    rest = a[j + 2:]
+                    sub = "-" + ch
+                    argv2 = [sub, rest] if rest else [sub]
+                    argv[i:i + 1] = argv2 + argv[i + 1:i + 1]  # re-inject as separate args
+                    i -= 1
+                    break
+                if ch == "G": get = True
+                if ch == "I": head = True
+        elif url is None: url = a
+        i += 1
+    body = "&".join(data) if data else ("\n".join(form) if form else None)
+    if method is None:
+        method = "HEAD" if head else "PUT" if upload else ("GET" if get else "POST") if (data or form) else "GET"
+    if get and data and url:
+        url = url + ("&" if "?" in url else "?") + body; body = None
+    if upload:
+        body = f"<upload {upload}>"
+    return method, url, headers, body, out
+
+def main():
+    argv = sys.argv[1:]
+    try:
+        method, url, headers, body, out = parse(list(argv))
+    except Exception:
+        method, url, headers, body, out = "?", None, {}, None, None
+    curl = real_curl()
+    hdr = tempfile.NamedTemporaryFile(prefix="docket-hdr-", delete=False); hdr.close()
+    cmd = [curl, "--dump-header", hdr.name] + argv
+    t0 = time.time()
+    captured = bytearray()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    # stream stdout through unchanged while keeping a copy
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk: break
+        sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+        if len(captured) < 4_000_000: captured.extend(chunk)
+    code = proc.wait()
+    ms = int((time.time() - t0) * 1000)
+    status = None
+    try:
+        for line in open(hdr.name, encoding="latin-1"):
+            if line.startswith("HTTP/"):
+                parts = line.split()
+                if len(parts) > 1 and parts[1].isdigit(): status = int(parts[1])
+    except Exception: pass
+    finally:
+        try: os.unlink(hdr.name)
+        except Exception: pass
+    resp = bytes(captured)
+    if out and out != "-":
+        try:
+            with open(out, "rb") as f: resp = f.read(4_000_000)
+        except Exception: resp = None
+    if url:
+        try:
+            from docket.recorder import Recorder
+            from docket import store
+            from urllib.parse import urlsplit, parse_qsl
+            d = store.find_dir()
+            if d:
+                u = urlsplit(url if "://" in url else "http://" + url)
+                Recorder(d).record({"transport": "http", "method": method, "host": u.hostname or "",
+                    "path": u.path or "/", "query": dict(parse_qsl(u.query)) if u.query else None,
+                    "req_headers": headers, "req_body": body, "status": status, "resp_body": resp,
+                    "ms": ms, "error": None if code == 0 else f"curl exit {code}"})
+        except Exception as e:
+            sys.stderr.write(f"[docket] curl record failed: {e}\n")
+    sys.exit(code)
+
+if __name__ == "__main__":
+    main()
