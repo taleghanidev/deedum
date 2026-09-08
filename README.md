@@ -31,8 +31,13 @@ is classified as a read. Secrets in headers and well-known body fields are redac
 Instead of remembering `docket run`, turn capture on for a whole shell:
 
 ```
-eval "$(docket env)"        # in ~/.zshrc, e.g. only when $CLAUDECODE is set
+eval "$(docket env)"        # in ~/.zshenv (NOT ~/.zshrc), e.g. only when $CLAUDECODE is set
 ```
+
+Use `~/.zshenv` / `~/.bashenv`-style files that every shell reads. Claude Code and most agent
+harnesses run commands in a **non-interactive** shell that never reads `.zshrc`, so a block there is
+silently ignored. If the harness resets `PATH` from a snapshot, also define
+`curl() { "$DOCKET_PKG/docket/shim/curl" "$@"; }` so the curl shim survives.
 
 Every Python and curl started from that shell is then recorded, no wrapper needed. Add a reason
 to a specific command with `DOCKET_WHY="raise bids" python x.py`, or keep using `docket run --why`
