@@ -21,7 +21,8 @@ DEFAULT_CONFIG = {
     "auth_path_regex": r"(?i)(oauth|/token|/auth\b|login|signin|credential|/session)",
     # Any `name=value` where name looks secret is scrubbed in text bodies, query strings and URLs.
     "scrub_regex": r"(?i)\b(token|access_token|refresh_token|id_token|secret|client_secret|password|passwd|pwd|sig|signature|api_key|apikey|key|auth|authorization|session|sessionid|bearer)=([^&\s\"'<>]+)",
-    "ignore_hosts": ["localhost", "127.0.0.1", "*.sentry.io", "*.posthog.com", "*.datadoghq.com"],
+    # Telemetry only. Local services are NOT ignored: a localhost API is still something you change.
+    "ignore_hosts": ["*.sentry.io", "*.posthog.com", "*.datadoghq.com"],
 }
 
 README = """# .docket — API change trail

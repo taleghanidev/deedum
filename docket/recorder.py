@@ -25,7 +25,7 @@ class Recorder:
         self._read_re = re.compile(self.cfg["read_path_regex"])
         self._auth_re = re.compile(self.cfg.get("auth_path_regex") or r"$^")
         self._scrub_re = re.compile(self.cfg.get("scrub_regex") or r"$^")
-        self.argv = self.scrub_argv(" ".join(sys.argv))[:300]
+        self.argv = self.scrub_argv(" ".join(sys.argv))[:2000]
 
     # ---- classification / redaction -------------------------------------------------------
     def ignored(self, host):

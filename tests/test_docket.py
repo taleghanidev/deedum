@@ -22,8 +22,6 @@ def serve():
 
 def trail():
     d = store.init_dir(tempfile.mkdtemp())
-    cfg = json.loads((d / "config.json").read_text()); cfg["ignore_hosts"] = []
-    (d / "config.json").write_text(json.dumps(cfg))
     return d
 
 def run(d, *cmd, why="t"):
