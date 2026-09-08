@@ -48,6 +48,8 @@ def test_classification():
     assert r.kind("POST", "h", "/CampaignManagement/v13/Campaigns/QueryByAccountId") == "read"
     assert r.kind("POST", "h", "/CampaignManagement/v13/EntityNegativeKeywords") == "write"
     assert r.kind("PUT", "h", "/v1/keywords") == "write"
+    assert r._graphql_kind(json.dumps({"query": "mutation { x }"})) == "write"
+    assert r._graphql_kind(json.dumps({"query": "query { x }"})) == "read"
 
 def test_curl_and_python_capture():
     base = serve(); d = trail()

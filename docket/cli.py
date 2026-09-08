@@ -1,5 +1,5 @@
 """docket command line."""
-import os, sys, json, argparse, subprocess, pathlib, uuid, textwrap, collections
+import os, sys, json, argparse, subprocess, pathlib, uuid, textwrap, collections, shlex
 from . import store, __version__
 
 PKG_DIR = str(pathlib.Path(__file__).resolve().parent.parent)
@@ -106,6 +106,21 @@ def _install_pth(cmd):
     except (PermissionError, OSError, subprocess.TimeoutExpired):
         pass
 
+def cmd_env(args):
+    """Print shell exports that turn on capture for every Python and curl started from this shell.
+    Use: eval "$(docket env)"  — typically in ~/.zshrc for Claude Code sessions."""
+    d = _dir(args)
+    q = shlex.quote
+    print(f"export DOCKET_DIR={q(str(d))}")
+    print(f"export DOCKET_RUN=always")
+    print(f"export DOCKET_PKG={q(PKG_DIR)}")
+    print(f'export PYTHONPATH={q(SHIM_DIR)}"${{PYTHONPATH:+:$PYTHONPATH}}"')
+    print(f'export PATH={q(SHIM_DIR)}:"$PATH"')
+
+def cmd_commit(args):
+    d = _dir(args)
+    print(store.git_commit(d, args.message or "docket: record API calls"))
+
 def _fmt_row(r):
     st = r["status"] if r.get("status") is not None else (r.get("error") or "")[:24]
     why = f"  why: {r['why']}" if r.get("why") else ""
@@ -196,6 +211,8 @@ def main(argv=None):
     a = sp.add_parser("show", help="full record of one call"); a.add_argument("id"); a.set_defaults(f=cmd_show)
     a = sp.add_parser("report", help="markdown summary of writes"); a.add_argument("--since", default="30d"); a.add_argument("--width", type=int, default=240); a.set_defaults(f=cmd_report)
     a = sp.add_parser("status", help="where the trail is and how much is in it"); a.set_defaults(f=cmd_status)
+    a = sp.add_parser("env", help='always-on mode: eval "$(docket env)" in a shell profile'); a.set_defaults(f=cmd_env)
+    a = sp.add_parser("commit", help="git commit whatever the trail has recorded"); a.add_argument("-m", "--message"); a.set_defaults(f=cmd_commit)
     args = p.parse_args(argv)
     if args.cmd == "run" and args.command and args.command[0] == "--":
         args.command = args.command[1:]

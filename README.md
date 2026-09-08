@@ -20,10 +20,23 @@ No code changes. `docket run` starts the command with hooks that capture:
 
 - Python: `requests`, `httpx`, `urllib` and **gRPC** (Google Ads, Google Cloud clients)
 - `curl` — a shim on PATH records the call and passes everything through unchanged
+- GraphQL — classified by operation: a `mutation` is a write, a `query` is a read
 - anything they spawn (the hooks travel through the environment)
 
 Reads are logged too and marked `read`; a POST that is really a query (`/Query`, `/Search`, `/Report`…)
 is classified as a read. Secrets in headers and well-known body fields are redacted before writing.
+
+## Always-on mode (for AI agent sessions)
+
+Instead of remembering `docket run`, turn capture on for a whole shell:
+
+```
+eval "$(docket env)"        # in ~/.zshrc, e.g. only when $CLAUDECODE is set
+```
+
+Every Python and curl started from that shell is then recorded, no wrapper needed. Add a reason
+to a specific command with `DOCKET_WHY="raise bids" python x.py`, or keep using `docket run --why`
+for changes. `docket commit` (or a session-end hook) commits what was gathered.
 
 ## What it writes
 

@@ -13,7 +13,10 @@ class Recorder:
         self.dir = pathlib.Path(trail_dir)
         self.cfg = store.load_config(self.dir)
         self.why = why or os.environ.get("DOCKET_WHY") or ""
-        self.run = run_id or os.environ.get("DOCKET_RUN") or uuid.uuid4().hex[:8]
+        env_run = os.environ.get("DOCKET_RUN")
+        if env_run == "always":  # always-on mode: group by the Claude Code session when there is one
+            env_run = ("session-" + os.environ["CLAUDE_CODE_SESSION_ID"][:8]) if os.environ.get("CLAUDE_CODE_SESSION_ID") else None
+        self.run = run_id or env_run or uuid.uuid4().hex[:8]
         self.cwd = os.getcwd()
         self.reads = 0
         self.writes = 0
@@ -37,6 +40,23 @@ class Recorder:
         if method == "POST" and self._read_re.search(path):
             return "read"
         return "write"
+
+    _gql_re = re.compile(r"^\s*(mutation|query|subscription)\b", re.I)
+
+    def _graphql_kind(self, raw):
+        """GraphQL sends reads and writes to one URL; look at the operation instead."""
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "replace")
+            if not isinstance(raw, str) or '"query"' not in raw[:200]:
+                return None
+            q = json.loads(raw).get("query", "")
+            m = self._gql_re.match(q)
+            if m:
+                return "write" if m.group(1).lower() == "mutation" else "read"
+            return "read" if q.lstrip().startswith("{") else None
+        except Exception:
+            return None
 
     def redact_headers(self, headers):
         out = {}
@@ -101,6 +121,9 @@ class Recorder:
         if self.ignored(rec.get("host", "")):
             return
         kind = self.kind(rec["method"], rec.get("host", ""), rec.get("path", ""))
+        gql = self._graphql_kind(rec.get("req_body"))
+        if gql:
+            kind = gql
         if self._auth_re.search(rec.get("path", "") or ""):
             rec = dict(rec, req_body="<redacted: credential exchange>", resp_body="<redacted: credential exchange>")
             kind = "read"

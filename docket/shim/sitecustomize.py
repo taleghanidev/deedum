@@ -6,6 +6,16 @@ if _pkg and _pkg not in sys.path:
 try:
     import docket
     docket.install()
+    # plant the env-gated .pth hook in this interpreter so scripts that overwrite PYTHONPATH still record
+    try:
+        import sysconfig, pathlib
+        _site = pathlib.Path(sysconfig.get_paths()["purelib"])
+        _src = pathlib.Path(__file__).with_name("docket_hook.py")
+        _hook, _pth = _site / "docket_hook.py", _site / "docket_hook.pth"
+        if _site.is_dir() and (not _pth.exists() or not _hook.exists() or _hook.read_text() != _src.read_text()):
+            _hook.write_text(_src.read_text()); _pth.write_text("import docket_hook\n")
+    except Exception:
+        pass
 except Exception as _e:
     sys.stderr.write(f"[docket] not installed in this process: {_e}\n")
 # chain any sitecustomize that this one shadowed
