@@ -61,18 +61,22 @@ class Recorder:
     def redact_headers(self, headers):
         out = {}
         for k, v in (headers or {}).items():
-            out[k] = "<redacted>" if k.lower() in self._redact_h else str(v)[:500]
+            out[k] = "<redacted>" if k.lower() in self._redact_h or self._secret_name_re.search(k) else str(v)[:500]
         return out
 
     def redact_obj(self, obj, depth=0):
         if depth > 30:
             return obj
         if isinstance(obj, dict):
-            return {k: ("<redacted>" if str(k).lower() in self._redact_b else self.redact_obj(v, depth + 1))
+            return {k: ("<redacted>" if str(k).lower() in self._redact_b or self._secret_name_re.search(str(k)) else self.redact_obj(v, depth + 1))
                     for k, v in obj.items()}
         if isinstance(obj, list):
             return [self.redact_obj(v, depth + 1) for v in obj]
         return obj
+
+    # Any header or body field whose NAME looks secret is redacted, not just the exact names in
+    # config: X-Auth-Key, xi-api-key, accessToken, input_token, appsecret_proof all slipped past the lists.
+    _secret_name_re = re.compile(r"(?i)(token|secret|passw|auth|credential|proof|signature|cookie|session|key$)")
 
     _bearer_re = re.compile(r"(?i)\b(bearer|basic|token|apikey|api-key)\s+[A-Za-z0-9._~+/=-]{6,}")
     _jsonkey_re = re.compile(r'(?i)("(?:[^"]*(?:token|secret|password|passwd|key|authorization|credential)[^"]*)"\s*:\s*)"[^"]*"')
