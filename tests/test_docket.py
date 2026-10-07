@@ -84,6 +84,8 @@ def test_value_scrub():
     for leaked in ("cfk_AAAA", "OddFormatValue", "pw12345", "sk-proj-x", "abcdefgh12345"):
         assert leaked not in out, leaked
     assert '"keyword": "house"' in out
+    out = scrub_values('curl -H "x-access-token: abcdef123456" "https://h/x?rwg_token=zz12345678&q=ok"')
+    assert "abcdef123456" not in out and "zz12345678" not in out and "q=ok" in out
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

@@ -30,6 +30,8 @@ _VALUE_RES = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),   # JWT
     re.compile(r"\b[a-z]{2,6}_[A-Za-z0-9]{32,}\b"),                       # prefix_longrandom (cfk_, cfut_, ...)
 ]
+# `x-access-token: abc`, `rwg_token=abc`, `X-Auth-Key: abc` inside argv, text bodies and URLs.
+_NAMEVAL_RE = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:token|secret|passw|credential|auth[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?key|websocket-key)[A-Za-z0-9_-]*\s*[:=]\s*)(?!<redacted>)[^\s\"'&<>,;\\]{6,}")
 _SECRET_ENV_RE = re.compile(r"(?i)(key|token|secret|passw|pwd|credential|auth|private|dsn|cookie|session)")
 _known = {"stamp": None, "values": []}
 
@@ -74,7 +76,7 @@ def scrub_values(text):
                 text = text.replace(esc, "<redacted>")
     for r in _VALUE_RES:
         text = r.sub("<redacted>", text)
-    return text
+    return _NAMEVAL_RE.sub(lambda m: m.group(1) + "<redacted>", text)
 
 
 class Recorder:
