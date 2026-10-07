@@ -31,7 +31,7 @@ _VALUE_RES = [
     re.compile(r"\b[a-z]{2,6}_[A-Za-z0-9]{32,}\b"),                       # prefix_longrandom (cfk_, cfut_, ...)
 ]
 # `x-access-token: abc`, `rwg_token=abc`, `X-Auth-Key: abc` inside argv, text bodies and URLs.
-_NAMEVAL_RE = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:token|secret|passw|credential|auth[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?key|websocket-key)[A-Za-z0-9_-]*\s*[:=]\s*)(?!<redacted>)[^\s\"'&<>,;\\]{6,}")
+_NAMEVAL_RE = re.compile(r"(?i)(?<!<)\b([A-Za-z0-9_-]*(?:token|secret|passw|credential|auth[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?key|websocket-key)[A-Za-z0-9_-]*\s*[:=]\s*)(?!<redacted>|<secret:)[^\s\"'&<>,;\\]{6,}")
 _SECRET_ENV_RE = re.compile(r"(?i)(key|token|secret|passw|pwd|credential|auth|private|dsn|cookie|session)")
 _known = {"stamp": None, "values": []}
 
@@ -47,7 +47,9 @@ def _env_files():
 
 
 def _secret_values():
-    """Exact values of every secret-named env var and .env entry: blanked wherever they appear."""
+    """(value, NAME) for every secret-named env var and .env entry, longest first. Wherever a value
+    appears it is replaced by <secret:NAME#fp>, so the trail says WHICH credential a call used
+    (and, through the fingerprint, which version of it) without ever holding the value."""
     files = _env_files()
     stamp = (tuple(sorted(os.environ.items())), tuple((str(f), f.stat().st_mtime) for f in files))
     if stamp == _known["stamp"]:
@@ -62,33 +64,56 @@ def _secret_values():
                     pairs.append((k.strip(), v.strip().strip("'\"")))
         except OSError:
             pass
-    vals = {v for k, v in pairs if _SECRET_ENV_RE.search(k) and len(v) >= 12 and not v.startswith(("/", "http"))}
-    _known.update(stamp=stamp, values=sorted(vals, key=len, reverse=True))
+    named = {}
+    for k, v in pairs:
+        k = k.strip()
+        if _SECRET_ENV_RE.search(k) and len(v) >= 12 and not v.startswith(("/", "http")) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            named.setdefault(v, k)  # the process env wins over .env files for the name
+    _known.update(stamp=stamp, values=sorted(named.items(), key=lambda kv: len(kv[0]), reverse=True))
     return _known["values"]
 
 
+def secrets_in(*texts):
+    """Names of the known secrets that appear in any of these strings (before redaction)."""
+    found = []
+    blob = "\n".join(t for t in texts if isinstance(t, str))
+    if not blob:
+        return found
+    for v, name in _secret_values():
+        if v in blob and name not in found:
+            found.append(name)
+    return found
+
+
 def scrub_values(text):
-    for v in _secret_values():
+    for v, name in _secret_values():
         if v in text:
-            text = text.replace(v, "<redacted>")
+            tag = store.secret_tag(name, v)
+            text = text.replace(v, tag)
             esc = json.dumps(v)[1:-1]
             if esc != v:
-                text = text.replace(esc, "<redacted>")
+                text = text.replace(esc, tag)
     for r in _VALUE_RES:
         text = r.sub("<redacted>", text)
     return _NAMEVAL_RE.sub(lambda m: m.group(1) + "<redacted>", text)
+
+
+class DocketBlocked(PermissionError):
+    """Raised instead of sending a write that `docket run --dry` or require_why_hosts refused."""
 
 
 class Recorder:
     def __init__(self, trail_dir, why=None, run_id=None):
         self.dir = pathlib.Path(trail_dir)
         self.cfg = store.load_config(self.dir)
-        self.why = why or os.environ.get("DOCKET_WHY") or ""
+        self._why_arg = why or os.environ.get("DOCKET_WHY") or ""
+        self.dry = os.environ.get("DOCKET_DRY") == "1"
         env_run = os.environ.get("DOCKET_RUN")
         if env_run == "always":  # always-on mode: group by the Claude Code session when there is one
             env_run = ("session-" + os.environ["CLAUDE_CODE_SESSION_ID"][:8]) if os.environ.get("CLAUDE_CODE_SESSION_ID") else None
         self.run = run_id or env_run or uuid.uuid4().hex[:8]
         self.cwd = os.getcwd()
+        self.project = store.project_of(self.cwd)
         self.reads = 0
         self.writes = 0
         self._redact_h = {h.lower() for h in self.cfg["redact_headers"]}
@@ -97,6 +122,32 @@ class Recorder:
         self._auth_re = re.compile(self.cfg.get("auth_path_regex") or r"$^")
         self._scrub_re = re.compile(self.cfg.get("scrub_regex") or r"$^")
         self.argv = self.scrub_argv(" ".join(sys.argv))[:2000]
+
+    @property
+    def why(self):
+        """--why / DOCKET_WHY, else the session's reason set with `docket why "..."` (re-read on
+        every call, so a reason set mid-session applies to the very next call)."""
+        return self._why_arg or store.get_session_why(self.dir) or ""
+
+    def gate(self, method, host, path, body=None):
+        """Called before a request leaves. Returns a refusal reason, or None to let it go."""
+        kind = self.kind(method, host or "", path or "")
+        gql = self._graphql_kind(body)
+        if gql:
+            kind = gql
+        if kind != "write" or self._auth_re.search(path or ""):
+            return None
+        if self.dry:
+            return "docket dry run: write not sent"
+        if not self.why and any(fnmatch.fnmatch((host or "").lower(), p) for p in self.cfg.get("require_why_hosts", [])):
+            return f"docket: writes to {host} need a reason (docket run --why, or docket why \"...\")"
+        return None
+
+    def blocked(self, transport, method, host, path, query, headers, body, reason):
+        self.record({"transport": transport, "method": method, "host": host, "path": path, "query": query,
+                     "req_headers": headers, "req_body": body, "status": "BLOCKED", "resp_body": None,
+                     "ms": 0, "error": reason})
+        return DocketBlocked(reason)
 
     # ---- classification / redaction -------------------------------------------------------
     def ignored(self, host):
@@ -132,7 +183,14 @@ class Recorder:
     def redact_headers(self, headers):
         out = {}
         for k, v in (headers or {}).items():
-            out[k] = "<redacted>" if k.lower() in self._redact_h or self._secret_name_re.search(k) else str(v)[:500]
+            v = v.decode("latin-1") if isinstance(v, bytes) else str(v)
+            if k.lower() in self._redact_h or self._secret_name_re.search(k):
+                named = secrets_in(v)
+                # keep the scheme ("Bearer") and say which credential it was
+                scheme = v.split(" ", 1)[0] + " " if " " in v and len(v.split(" ", 1)[0]) < 12 else ""
+                out[k] = scheme + ("".join(store.secret_tag(n, sv) for sv, n in _secret_values() if n in named[:1]) if named else "<redacted>")
+            else:
+                out[k] = v[:500]
         return out
 
     def redact_obj(self, obj, depth=0):
@@ -193,12 +251,19 @@ class Recorder:
     def record(self, rec):
         """rec: dict with transport, method, host, path, query, req_headers, req_body, status,
         resp_headers, resp_body, ms, error"""
-        if self.ignored(rec.get("host", "")):
+        host = rec.get("host", "") or ""
+        if not store.valid_host(host) or self.ignored(host):
             return
-        kind = self.kind(rec["method"], rec.get("host", ""), rec.get("path", ""))
+        kind = self.kind(rec["method"], host, rec.get("path", ""))
         gql = self._graphql_kind(rec.get("req_body"))
         if gql:
             kind = gql
+        if kind == "read" and any(fnmatch.fnmatch(host.lower(), p) for p in self.cfg.get("ignore_read_hosts", [])):
+            return
+        raw_body = rec.get("req_body")
+        used = secrets_in(json.dumps({k: (v.decode("latin-1") if isinstance(v, bytes) else str(v)) for k, v in (rec.get("req_headers") or {}).items()}),
+                          raw_body.decode("utf-8", "replace") if isinstance(raw_body, (bytes, bytearray)) else raw_body if isinstance(raw_body, str) else None,
+                          json.dumps(rec.get("query") or {}), self.argv)
         if self._auth_re.search(rec.get("path", "") or ""):
             rec = dict(rec, req_body="<redacted: credential exchange>", resp_body="<redacted: credential exchange>")
             kind = "read"
@@ -209,8 +274,11 @@ class Recorder:
         resp_lim = self.cfg["write_response_max"] if kind == "write" else self.cfg["read_response_max"]
         ts = store.now_iso()
         rid = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        why = self.why
         out = {
-            "id": rid, "ts": ts, "run": self.run, "why": self.why, "kind": kind,
+            "id": rid, "ts": ts, "run": self.run, "why": why, "kind": kind,
+            "project": self.project["name"], "folder": self.project["folder"], "branch": self.project["branch"],
+            "service": store.service_of(host, self.cfg), "secrets": used or None,
             "transport": rec["transport"], "method": rec["method"], "host": rec.get("host"),
             "path": rec.get("path"), "query": rec.get("query") or None,
             "request": {"headers": self.redact_headers(rec.get("req_headers")),
@@ -229,9 +297,10 @@ class Recorder:
             if kind == "write":
                 self.writes += 1
                 status = out["status"] if out["status"] is not None else (out["error"] or "?")
-                why = f" · why: {self.why}" if self.why else ""
+                whys = f" · why: {why}" if why else ""
+                proj = f"[{out['project']}] " if out["project"] else ""
                 with open(self.dir / "CHANGES.md", "a", encoding="utf-8") as f:
-                    f.write(scrub_values(f"- {ts[:16].replace('T', ' ')} · {out['host']} · {out['method']} {out['path']} · {status}{why} · `{rid}`\n"))
+                    f.write(scrub_values(f"- {ts[:16].replace('T', ' ')} · {proj}{out['service']} · {out['method']} {out['host']}{out['path']} · {status}{whys} · `{rid}`\n"))
             else:
                 self.reads += 1
 
@@ -239,6 +308,7 @@ class Recorder:
         if self.reads + self.writes == 0 and os.environ.get("DOCKET_RUN") in (None, "always"):
             return None  # a process that made no calls leaves no run line (always-on mode would flood runs/)
         rec = {"run": self.run, "argv": self.argv, "cwd": self.cwd, "why": self.why,
+               "project": self.project["name"], "folder": self.project["folder"], "branch": self.project["branch"],
                "started": started, "ended": store.now_iso(), "reads": self.reads,
                "writes": self.writes, "exit": exit_code}
         with _lock:
@@ -262,7 +332,12 @@ def _hook_requests(rec):
     if getattr(orig, "_docket", False):
         return True
     def send(self, request, **kw):
+        host, path, q = _split(request.url)
+        why_not = rec.gate(request.method.upper(), host, path, request.body)
+        if why_not:
+            raise rec.blocked("http", request.method.upper(), host, path, q, dict(request.headers), request.body, why_not)
         t0 = time.time(); resp = None; err = None
+        _tl.inner = getattr(_tl, "inner", 0) + 1
         try:
             resp = orig(self, request, **kw)
             return resp
@@ -270,8 +345,8 @@ def _hook_requests(rec):
             err = f"{type(e).__name__}: {e}"[:500]
             raise
         finally:
+            _tl.inner -= 1
             try:
-                host, path, q = _split(request.url)
                 rec.record({"transport": "http", "method": request.method.upper(), "host": host,
                             "path": path, "query": q, "req_headers": dict(request.headers),
                             "req_body": request.body,
@@ -312,8 +387,14 @@ def _hook_httpx(rec):
                             "resp_body": body, "ms": int((time.time() - t0) * 1000), "error": err})
             except Exception as e:
                 sys.stderr.write(f"[docket] record failed: {e}\n")
+        def check(request):
+            host, path, q = _split(str(request.url))
+            why_not = rec.gate(request.method.upper(), host, path, request.content)
+            if why_not:
+                raise rec.blocked("http", request.method.upper(), host, path, q, dict(request.headers), request.content, why_not)
         if is_async:
             async def send(self, request, **kw):
+                check(request)
                 t0 = time.time(); resp = None; err = None
                 try:
                     resp = await orig(self, request, **kw)
@@ -326,6 +407,7 @@ def _hook_httpx(rec):
                     after(request, resp, err, t0)
         else:
             def send(self, request, **kw):
+                check(request)
                 t0 = time.time(); resp = None; err = None
                 try:
                     resp = orig(self, request, **kw)
@@ -349,6 +431,10 @@ def _hook_urllib(rec):
         return True
     def open_(self, fullurl, data=None, timeout=None):
         req = fullurl if isinstance(fullurl, ur.Request) else ur.Request(fullurl, data=data)
+        h0, p0, q0 = _split(req.full_url)
+        why_not = rec.gate(req.get_method().upper(), h0, p0, data if data is not None else req.data)
+        if why_not:
+            raise rec.blocked("http", req.get_method().upper(), h0, p0, q0, dict(req.header_items()), data if data is not None else req.data, why_not)
         t0 = time.time(); resp = None; err = None; status = None; body = None
         try:
             resp = orig(self, fullurl, data, timeout) if timeout is not None else orig(self, fullurl, data)
@@ -381,6 +467,57 @@ def _hook_urllib(rec):
     open_._docket = True
     ur.OpenerDirector.open = open_
     return True
+
+_tl = threading.local()
+
+
+def _hook_urllib3(rec):
+    """botocore (AWS SDK), pip and many SDKs talk to urllib3 directly, not through requests.
+    Calls made BY requests also pass through here; those are skipped (requests recorded them)."""
+    try:
+        import importlib.util
+        if "urllib3" not in sys.modules and importlib.util.find_spec("urllib3") is None:
+            return False
+        import urllib3.connectionpool as cp
+    except Exception:
+        return False
+    orig = cp.HTTPConnectionPool.urlopen
+    if getattr(orig, "_docket", False):
+        return True
+    def urlopen(self, method, url, body=None, headers=None, *a, **kw):
+        if getattr(_tl, "inner", 0) > 0 or getattr(_tl, "u3", 0) > 0:
+            return orig(self, method, url, body, headers, *a, **kw)
+        host = self.host
+        u = urlsplit(url) if "://" in url else None
+        path = (u.path if u else url.split("?", 1)[0]) or "/"
+        query = dict(parse_qsl(u.query if u else (url.split("?", 1)[1] if "?" in url else ""))) or None
+        why_not = rec.gate(method.upper(), host, path, body)
+        if why_not:
+            raise rec.blocked("http", method.upper(), host, path, query, dict(headers or {}), body, why_not)
+        t0 = time.time(); resp = None; err = None
+        _tl.u3 = 1  # retries/redirects re-enter urlopen: record the outer call once
+        try:
+            resp = orig(self, method, url, body, headers, *a, **kw)
+            return resp
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:500]; raise
+        finally:
+            _tl.u3 = 0
+            try:
+                data = None
+                if resp is not None and kw.get("preload_content", True):
+                    data = getattr(resp, "data", None)
+                rec.record({"transport": "http", "method": method.upper(), "host": host, "path": path,
+                            "query": query, "req_headers": dict(headers or {}),
+                            "req_body": body if isinstance(body, (bytes, str)) else None,
+                            "status": getattr(resp, "status", None), "resp_body": data,
+                            "ms": int((time.time() - t0) * 1000), "error": err})
+            except Exception as e:
+                sys.stderr.write(f"[docket] record failed: {e}\n")
+    urlopen._docket = True
+    cp.HTTPConnectionPool.urlopen = urlopen
+    return True
+
 
 def _proto_to_obj(msg):
     try:
@@ -461,15 +598,17 @@ def install(trail_dir=None, why=None):
     if d is None:
         raise RuntimeError("docket: no trail directory. Run `docket init` or set DOCKET_DIR.")
     rec = Recorder(d, why=why)
-    _hook_requests(rec); _hook_httpx(rec); _hook_urllib(rec); _hook_grpc(rec)
+    _hook_requests(rec); _hook_httpx(rec); _hook_urllib(rec); _hook_grpc(rec); _hook_urllib3(rec)
     # libraries imported later: hook them on import
     import builtins
     orig_import = builtins.__import__
     def imp(name, *a, **kw):
         m = orig_import(name, *a, **kw)
         try:
-            if name.split(".")[0] in ("requests", "httpx", "grpc"):
-                {"requests": _hook_requests, "httpx": _hook_httpx, "grpc": _hook_grpc}[name.split(".")[0]](rec)
+            top = name.split(".")[0]
+            if top in ("requests", "httpx", "grpc", "urllib3", "botocore"):
+                {"requests": _hook_requests, "httpx": _hook_httpx, "grpc": _hook_grpc,
+                 "urllib3": _hook_urllib3, "botocore": _hook_urllib3}[top](rec)
         except Exception:
             pass
         return m

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docket"
-version = "0.1.0"
+version = "0.2.0"
 description = "A git-friendly record of every API call a command makes: the payload, the response, and why."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,4 +19,4 @@ packages = ["docket"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-docket = ["shim/*.py", "shim/curl"]
+docket = ["shim/*.py", "shim/curl", "shim/*.cjs", "shim/*.json"]

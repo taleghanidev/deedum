@@ -1,0 +1,158 @@
+[
+[
+"googleads.googleapis.com",
+"Google Ads"
+],
+[
+"*.bingads.microsoft.com",
+"Microsoft Ads"
+],
+[
+"ads-api.reddit.com",
+"Reddit Ads"
+],
+[
+"api.ads.openai.com",
+"OpenAI Ads"
+],
+[
+"graph.facebook.com",
+"Meta"
+],
+[
+"graph.instagram.com",
+"Instagram"
+],
+[
+"api.linkedin.com",
+"LinkedIn"
+],
+[
+"searchconsole.googleapis.com",
+"Search Console"
+],
+[
+"mybusiness*.googleapis.com",
+"Google Business Profile"
+],
+[
+"sheets.googleapis.com",
+"Google Sheets"
+],
+[
+"gmail.googleapis.com",
+"Gmail"
+],
+[
+"www.googleapis.com",
+"Google APIs"
+],
+[
+"oauth2.googleapis.com",
+"Google OAuth"
+],
+[
+"*.googleapis.com",
+"Google Cloud"
+],
+[
+"api.stripe.com",
+"Stripe"
+],
+[
+"api.twilio.com",
+"Twilio"
+],
+[
+"*.twilio.com",
+"Twilio"
+],
+[
+"api.cloudflare.com",
+"Cloudflare"
+],
+[
+"*.r2.cloudflarestorage.com",
+"Cloudflare R2"
+],
+[
+"api.vercel.com",
+"Vercel"
+],
+[
+"api.github.com",
+"GitHub"
+],
+[
+"api.monday.com",
+"Monday"
+],
+[
+"api.linear.app",
+"Linear"
+],
+[
+"api.openai.com",
+"OpenAI"
+],
+[
+"api.anthropic.com",
+"Anthropic"
+],
+[
+"openrouter.ai",
+"OpenRouter"
+],
+[
+"api.elevenlabs.io",
+"ElevenLabs"
+],
+[
+"api.resend.com",
+"Resend"
+],
+[
+"api.vendor-c.example",
+"Vendor C"
+],
+[
+"api.vendor-d.example",
+"Vendor D"
+],
+[
+"vendor-e.example",
+"Vendor E"
+],
+[
+"api.vendor-e.example",
+"Vendor E"
+],
+[
+"*.amazonaws.com",
+"AWS"
+],
+[
+"api.telegram.org",
+"Telegram"
+],
+[
+"api.vendor-b.example",
+"Vendor B"
+],
+[
+"*.vendor-a.example",
+"Vendor A"
+],
+[
+"console.neon.tech",
+"Neon"
+],
+[
+"*.pages.dev",
+"Cloudflare Pages site"
+],
+[
+"*.vercel.app",
+"Vercel site"
+]
+]

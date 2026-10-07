@@ -86,6 +86,27 @@ def main():
     except Exception:
         method, url, headers, body, out = "?", None, {}, None, None
     curl = real_curl()
+    # Dry run / require-a-reason: a refused write never reaches the real curl.
+    if url:
+        try:
+            from docket.recorder import Recorder
+            from docket import store
+            from urllib.parse import urlsplit, parse_qsl
+            d = store.find_dir()
+            if d:
+                u = urlsplit(url if "://" in url else "http://" + url)
+                rec = Recorder(d)
+                path = u.path or "/"
+                why_not = rec.gate(method, u.hostname or "", path, body)
+                if why_not:
+                    rec.blocked("http", method, u.hostname or "", path,
+                                dict(parse_qsl(u.query)) if u.query else None, headers, body, why_not)
+                    sys.stderr.write(f"[docket] {why_not}: {method} {u.hostname}{path}\n")
+                    sys.exit(7)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
     hdr = tempfile.NamedTemporaryFile(prefix="docket-hdr-", delete=False); hdr.close()
     cmd = [curl, "--dump-header", hdr.name] + argv
     t0 = time.time()
