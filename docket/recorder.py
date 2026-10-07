@@ -8,6 +8,75 @@ from . import store
 _lock = threading.Lock()
 _installed = False
 
+
+# ---- last line of defence: scrub key-shaped VALUES from the serialized record ---------------
+# Field-name redaction misses keys that travel under an unexpected name, inside a URL, a text
+# body, a response or argv. Everything written to the trail passes through scrub_values() first.
+_VALUE_RES = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"(?i)\b(bearer|basic)(\s+|%20)[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?<=://)[^/\s:@\"']+:[^/\s@\"']+(?=@)"),                  # user:pass@ in URLs
+    re.compile(r"\b(sk|rk|pk_live|sk_live|sk_test|rk_live|whsec|xai|gsk|pplx|fc)[-_][A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bsk-(ant|or|proj|svcacct|admin)?-?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}"),
+    re.compile(r"\b1//0[0-9A-Za-z_-]{30,}"),
+    re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bEAA[A-Za-z0-9]{30,}"),
+    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bre_[A-Za-z0-9]{8}_[A-Za-z0-9]{16,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),   # JWT
+    re.compile(r"\b[a-z]{2,6}_[A-Za-z0-9]{32,}\b"),                       # prefix_longrandom (cfk_, cfut_, ...)
+]
+_SECRET_ENV_RE = re.compile(r"(?i)(key|token|secret|passw|pwd|credential|auth|private|dsn|cookie|session)")
+_known = {"stamp": None, "values": []}
+
+
+def _env_files():
+    d, out = pathlib.Path.cwd().resolve(), []
+    home = pathlib.Path.home().resolve()
+    for p in [d, *d.parents]:
+        out += [f for f in p.glob(".env*") if f.is_file() and not f.name.endswith((".example", ".sample", ".template"))]
+        if p == home:
+            break
+    return out
+
+
+def _secret_values():
+    """Exact values of every secret-named env var and .env entry: blanked wherever they appear."""
+    files = _env_files()
+    stamp = (tuple(sorted(os.environ.items())), tuple((str(f), f.stat().st_mtime) for f in files))
+    if stamp == _known["stamp"]:
+        return _known["values"]
+    pairs = list(os.environ.items())
+    for f in files:
+        try:
+            for ln in f.read_text(errors="ignore").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.removeprefix("export ").split("=", 1)
+                    pairs.append((k.strip(), v.strip().strip("'\"")))
+        except OSError:
+            pass
+    vals = {v for k, v in pairs if _SECRET_ENV_RE.search(k) and len(v) >= 12 and not v.startswith(("/", "http"))}
+    _known.update(stamp=stamp, values=sorted(vals, key=len, reverse=True))
+    return _known["values"]
+
+
+def scrub_values(text):
+    for v in _secret_values():
+        if v in text:
+            text = text.replace(v, "<redacted>")
+            esc = json.dumps(v)[1:-1]
+            if esc != v:
+                text = text.replace(esc, "<redacted>")
+    for r in _VALUE_RES:
+        text = r.sub("<redacted>", text)
+    return text
+
+
 class Recorder:
     def __init__(self, trail_dir, why=None, run_id=None):
         self.dir = pathlib.Path(trail_dir)
@@ -150,7 +219,7 @@ class Recorder:
             "cwd": self.cwd, "argv": self.argv,
         }
         day = ts[:10]
-        line = json.dumps(out, ensure_ascii=False, default=str)
+        line = scrub_values(json.dumps(out, ensure_ascii=False, default=str))
         with _lock:
             (self.dir / "calls").mkdir(parents=True, exist_ok=True)
             with open(self.dir / "calls" / f"{day}.jsonl", "a", encoding="utf-8") as f:
@@ -160,7 +229,7 @@ class Recorder:
                 status = out["status"] if out["status"] is not None else (out["error"] or "?")
                 why = f" · why: {self.why}" if self.why else ""
                 with open(self.dir / "CHANGES.md", "a", encoding="utf-8") as f:
-                    f.write(f"- {ts[:16].replace('T', ' ')} · {out['host']} · {out['method']} {out['path']} · {status}{why} · `{rid}`\n")
+                    f.write(scrub_values(f"- {ts[:16].replace('T', ' ')} · {out['host']} · {out['method']} {out['path']} · {status}{why} · `{rid}`\n"))
             else:
                 self.reads += 1
 
@@ -173,7 +242,7 @@ class Recorder:
         with _lock:
             (self.dir / "runs").mkdir(parents=True, exist_ok=True)
             with open(self.dir / "runs" / f"{rec['ended'][:10]}.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(scrub_values(json.dumps(rec, ensure_ascii=False)) + "\n")
         return rec
 
 

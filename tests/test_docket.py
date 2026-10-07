@@ -74,6 +74,17 @@ def test_requests_capture_if_installed():
     assert out.returncode == 0, out.stderr
     assert records(d)[0]["request"]["body"]["_json"] == {"a": 1}
 
+
+def test_value_scrub():
+    from docket.recorder import scrub_values
+    os.environ["DOCKET_TEST_API_TOKEN"] = "OddFormatValue0123456789"
+    line = json.dumps({"a": "cfk_" + "A" * 40, "b": "OddFormatValue0123456789", "c": "https://u:pw12345@h/x",
+                       "d": "sk-proj-" + "x" * 30, "e": "Bearer abcdefgh12345", "keyword": "house"})
+    out = scrub_values(line)
+    for leaked in ("cfk_AAAA", "OddFormatValue", "pw12345", "sk-proj-x", "abcdefgh12345"):
+        assert leaked not in out, leaked
+    assert '"keyword": "house"' in out
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
