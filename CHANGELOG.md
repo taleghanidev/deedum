@@ -83,8 +83,9 @@ The release that makes the trail safe to keep and complete enough to trust.
 ### Packaging
 - `install.sh`: one line installs deedum with or without Python on the machine (`uv` brings a
   managed Python when there is none), into `~/.local/share/deedum`, no sudo, then runs setup.
-- CI on Python 3.9–3.13, macOS and Linux. `pip install -e ".[test]"` brings pytest. CONTRIBUTING,
-  code of conduct, SECURITY, a gitleaks allowlist for the test fixtures.
+- Installed by `install.sh` only, like any modern CLI: no PyPI or npm package. CI on Python
+  3.9–3.13, macOS and Linux. `pip install -e ".[test]"` brings pytest for development.
+  CONTRIBUTING, code of conduct, SECURITY, a gitleaks allowlist for the test fixtures.
 
 ## 0.2.0 — 2026-09-12
 Every folder, every project, Node, named secrets, dry runs.

@@ -313,15 +313,15 @@ fetch a managed Python; installs deedum into its own environment under `~/.local
 (no system Python touched, no sudo); links the `deedum` command into `~/.local/bin`; runs
 `deedum setup --write`; and, when Claude Code is present, `deedum hook claude --write`. To read
 the script first: `curl -fsSLO <the same URL> && sh install.sh`. `DEEDUM_NO_SETUP=1` skips the
-setup step, `DEEDUM_VERSION=v0.3.0` pins a tag. With a Python already there, `pipx install
-deedum` (once on PyPI) or `pipx install git+https://github.com/taleghanidev/deedum` do the same.
+setup step, `DEEDUM_VERSION=v0.3.0` pins a tag. There is nothing to install from PyPI or npm:
+the script is the installer, like any modern CLI.
 
 Update: run the same line again. Remove: `deedum unhook --find --remove`, delete the block
 between `# >>> deedum >>>` and `# <<< deedum <<<` in `~/.zshenv`, delete `~/.local/share/deedum`
 and `~/.local/bin/deedum`; the trail (`~/.deedum`) is yours to keep or delete.
 
-Zero dependencies. macOS and Linux. Node 18+ for the Node hook. One package: the Node hook and
-the curl and binary shims ship inside it, there is nothing to install from npm.
+Zero dependencies. macOS and Linux. Node 18+ for the Node hook. The Node hook and the curl and
+binary shims ship with it.
 
 ## How it compares
 
