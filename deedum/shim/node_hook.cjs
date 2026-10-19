@@ -547,7 +547,7 @@
         project: PROJECT.name, folder: PROJECT.folder, branch: PROJECT.branch,
         agent: AGENT, via: 'script',
         service: serviceOf(host), secrets: used.length ? used : null,
-        transport: 'http', method: r.method, host, path: r.path, query,
+        transport: 'http', method: r.method, host, origin: r.origin || null, path: r.path, query,
         request: { headers: redactHeaders(r.headers), body: body(reqBody, w ? cfg.write_request_max : cfg.read_request_max) },
         status: r.status ?? null,
         response: { body: body(respBody, w ? cfg.write_response_max : cfg.read_response_max) },
@@ -596,11 +596,12 @@
           u = new URL(url)
         } catch {}
         const host = u ? u.hostname : ''
+        const origin = u ? u.origin : null
         const p = u ? u.pathname || '/' : '/'
         const query = u && u.search ? Object.fromEntries(u.searchParams) : null
         const no = u ? gate(method, host, p, typeof reqBody === 'string' ? reqBody : null) : null
         if (no) {
-          record({ method, host, path: p, query, headers, reqBody, status: 'BLOCKED', error: no, ms: 0 })
+          record({ method, host, origin, path: p, query, headers, reqBody, status: 'BLOCKED', error: no, ms: 0 })
           throw new TypeError(no)
         }
         const t0 = Date.now()
@@ -608,7 +609,7 @@
         try {
           resp = await orig.call(this, input, init)
         } catch (e) {
-          if (u) record({ method, host, path: p, query, headers, reqBody, status: null, error: String(e && e.message).slice(0, 500), ms: Date.now() - t0 })
+          if (u) record({ method, host, origin, path: p, query, headers, reqBody, status: null, error: String(e && e.message).slice(0, 500), ms: Date.now() - t0 })
           throw e
         }
         if (u) {
@@ -619,9 +620,9 @@
             resp
               .clone()
               .text()
-              .then((t) => record({ method, host, path: p, query, headers, reqBody, status, respBody: t, ms }))
-              .catch(() => record({ method, host, path: p, query, headers, reqBody, status, ms }))
-          } else record({ method, host, path: p, query, headers, reqBody, status, ms })
+              .then((t) => record({ method, host, origin, path: p, query, headers, reqBody, status, respBody: t, ms }))
+              .catch(() => record({ method, host, origin, path: p, query, headers, reqBody, status, ms }))
+          } else record({ method, host, origin, path: p, query, headers, reqBody, status, ms })
         }
         return resp
       }
@@ -645,6 +646,7 @@
       const wrap = function request(...args) {
         let method = 'GET'
         let host = ''
+        let origin = null
         let p = '/'
         let query = null
         let headers = {}
@@ -658,6 +660,8 @@
           }
           method = String(opts.method || 'GET').toUpperCase()
           host = String(opts.hostname || opts.host || 'localhost').replace(/:\d+$/, '')
+          const port = opts.port || (String(opts.host || '').match(/:(\d+)$/) || [])[1]
+          origin = `${modName}://${host}${port && !['80', '443'].includes(String(port)) ? `:${port}` : ''}`
           const full = String(opts.path || '/')
           p = full.split('?')[0] || '/'
           if (full.includes('?')) query = Object.fromEntries(new URLSearchParams(full.split('?')[1]))
@@ -665,7 +669,7 @@
         } catch {}
         const no = gate(method, host, p, null)
         if (no) {
-          record({ method, host, path: p, query, headers, status: 'BLOCKED', error: no, ms: 0 })
+          record({ method, host, origin, path: p, query, headers, status: 'BLOCKED', error: no, ms: 0 })
           const req = origRequest.call(this, { hostname: '127.0.0.1', port: 9, path: '/' })
           req.destroy(new Error(no))
           return req
@@ -698,7 +702,7 @@
             if (done) return
             done = true
             const b = chunks.length ? Buffer.concat(chunks).toString('utf8') : null
-            record({ method, host, path: p, query, headers: { ...headers, ...(req.getHeaders ? req.getHeaders() : {}) }, reqBody: b, status, error, respBody, ms: Date.now() - t0 })
+            record({ method, host, origin, path: p, query, headers: { ...headers, ...(req.getHeaders ? req.getHeaders() : {}) }, reqBody: b, status, error, respBody, ms: Date.now() - t0 })
           }
           req.once('response', (res) => {
             // Copy the body as the stream delivers it through push(): nothing is consumed and the

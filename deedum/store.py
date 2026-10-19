@@ -40,6 +40,10 @@ DEFAULT_CONFIG = {
     # Housekeeping `deedum commit` does by itself: gzip day files older than this many days
     # (0 = never), dropping the response bodies of reads in them. `deedum prune` is the manual one.
     "compact_after_days": 14,
+    # Before a PUT/PATCH/DELETE to one of these hosts, GET the object (with the request's own
+    # credentials) and keep it on the record as `before`: `deedum diff ID` and `deedum undo ID`
+    # need it. Opt in per host: ["api.cloudflare.com", "*.googleapis.com"]. `deedum snapshot HOST`.
+    "snapshot_hosts": [],
 }
 
 

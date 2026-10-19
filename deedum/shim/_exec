@@ -41,6 +41,36 @@ READ_OPS = {
     "stripe": lambda w: w[:1] in (["listen"], ["logs"], ["status"], ["version"], ["help"], ["open"], ["resources"], ["get"]) or (len(w) >= 2 and w[1] == "list"),
 }
 READ_OPS["fly"] = READ_OPS["flyctl"]
+# Database clients: a read is a one-shot command (-c / -e / --eval) that starts with a read
+# keyword and has no write keyword anywhere; an interactive session (no command) is a write (we
+# cannot see what is typed into it). Containers: ps/logs/images/inspect read, the rest write.
+_SQL_READ = re.compile(r"^\s*(select|show|explain|describe|desc|with|\\d|\\l|\\dt|\\du|\\x|\\conninfo)\b", re.I)
+_SQL_WRITE = re.compile(r"\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|merge|replace|copy|vacuum|reindex|set|call|exec|execute|load)\b", re.I)
+_REDIS_READ = {"get", "mget", "hget", "hgetall", "hkeys", "hvals", "hlen", "keys", "scan", "sscan", "hscan", "zscan", "exists", "ttl", "pttl", "type",
+               "llen", "lrange", "lindex", "smembers", "sismember", "scard", "zrange", "zrangebyscore", "zcard", "zscore", "info", "ping", "dbsize",
+               "strlen", "getrange", "object", "memory", "client", "config get", "lastsave", "time", "echo", "randomkey"}
+_DOCKER_READ = {"ps", "logs", "images", "inspect", "version", "info", "stats", "top", "port", "diff", "history", "events", "search", "context",
+                "image ls", "image list", "image inspect", "container ls", "container list", "container inspect", "container logs",
+                "volume ls", "volume inspect", "network ls", "network inspect", "compose ps", "compose logs", "compose config", "system df"}
+
+
+def _db_sql(args):
+    for i, a in enumerate(args):
+        if a in ("-c", "--command", "-e", "--execute") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(("--command=", "--execute=")):
+            return a.split("=", 1)[1]
+        if a.startswith("-c") and len(a) > 2 and not a.startswith("--"):
+            return a[2:]
+    return None
+
+
+def _db_kind(args):
+    """psql/mysql/mariadb: the one-shot SQL is after -c / -e / --command=; none given = interactive."""
+    sql = _db_sql(args)
+    if sql is None or "-f" in args or "--file" in args or any(a.startswith("--file=") for a in args):
+        return "write"
+    return "read" if _SQL_READ.match(sql) and not _SQL_WRITE.search(sql) else "write"
 # wrangler: the exact read sequences, so a database or namespace NAMED "list" changes nothing
 # (`wrangler d1 execute list --command='DROP TABLE'` is a write).
 WRANGLER_READS = {("whoami",), ("tail",), ("deployments", "list"), ("deployments", "status"), ("versions", "list"), ("versions", "view"),
@@ -277,7 +307,7 @@ def describe(argv):
     """(host, subcommand, kind) for the record. host is what the call reaches: the ssh host,
     the AWS profile or region, the gh/kubectl/wrangler target, else the tool's own name."""
     args = [a for a in argv if a]
-    flags_with_value = {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-E", "-S", "-b", "-c", "-e", "-m", "-P",
+    flags_with_value = {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-E", "-S", "-b", "-c", "-e", "-m", "-P", "-h", "--host", "-U", "-u", "-d", "-H", "--context", "--eval",
                         "--profile", "--region", "--context", "--namespace", "-n", "--kubeconfig", "--project", "--account",
                         "--subscription", "--env", "--app", "-a", "--repo", "-R", "--hostname", "--config", "--scope",
                         "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}   # git's global options
@@ -315,6 +345,13 @@ def describe(argv):
         host = opts.get("--context") or os.environ.get("KUBECONFIG", "").split("/")[-1] or "kubectl"
     elif NAME == "gh":
         host = opts.get("--hostname") or opts.get("-R") or opts.get("--repo") or "github.com"
+    elif NAME in ("psql", "mysql", "mariadb", "redis-cli", "mongosh", "mongo"):
+        host = opts.get("-h") or opts.get("--host") or next((a.split("=", 1)[1] for a in args if a.startswith("--host=")), None) \
+            or next((re.sub(r"^[a-z]+://(?:[^@/]*@)?", "", a).split("/")[0].split("?")[0] for a in args if "://" in a), None) \
+            or os.environ.get("PGHOST") or os.environ.get("MYSQL_HOST") or "localhost"
+        host = host.split(":")[0] or "localhost"
+    elif NAME in ("docker", "podman"):
+        host = opts.get("--context") or opts.get("-H") or os.environ.get("DOCKER_CONTEXT") or NAME
     elif NAME == "git":
         gw, _ = _git_expand(args, words)
         host = (gw[1] if len(gw) > 1 and gw[0] == "push" and not gw[1].startswith("-") else "git")
@@ -336,6 +373,20 @@ def describe(argv):
         kind = "read" if ssh_safe and ssh_is_read(remote_cmd) else "write"   # no command = an interactive shell
     elif NAME in ("scp", "rsync"):
         kind = "write"
+    elif NAME in ("psql", "mysql", "mariadb"):
+        kind = _db_kind(args)
+        sub = (_db_sql(args) or "interactive session")[:200]
+    elif NAME == "redis-cli":
+        sub = (" ".join(words) or "interactive session")[:200]
+        cmd2 = " ".join(w.lower() for w in words[:2]) if words else ""
+        kind = "read" if words and (words[0].lower() in _REDIS_READ or cmd2 in _REDIS_READ) and "--eval" not in args and "--pipe" not in args else "write"
+    elif NAME in ("mongosh", "mongo"):
+        ev = next((args[i + 1] for i, a in enumerate(args) if a == "--eval" and i + 1 < len(args)), None)
+        sub = (ev or "interactive session")[:200]
+        kind = "read" if ev and re.match(r"^\s*(db\.[A-Za-z_]+\.(find|findOne|countDocuments|count|aggregate|distinct)\(|show\s|db\.(stats|getName|serverStatus)\()", ev) \
+            and not re.search(r"\b(insert|update|delete|remove|drop|create|replace|rename|bulkWrite|findAndModify|findOneAnd)\w*\(", ev) else "write"
+    elif NAME in ("docker", "podman"):
+        kind = "read" if ops and (ops[0] in _DOCKER_READ or " ".join(ops[:2]) in _DOCKER_READ) else "write"
     elif NAME in READ_OPS and not _write_verb(ops) and _read(READ_OPS[NAME], ops, args):
         # `add-metadata`, `set-iam-policy`, `delete-log-group`: a write verb inside a hyphenated operation counts
         kind = "read"
@@ -377,7 +428,8 @@ def main():
         if d and os.environ.get("DEEDUM_RUN"):
             rec = Recorder(d)
             host, sub, kind = describe(argv)
-            sub = rec.scrub_argv(_scrub_command_text(sub))   # `deploy --password "a b c"` goes into path and CHANGES.md
+            from deedum.recorder import scrub_prose
+            sub = scrub_prose(rec.scrub_argv(_scrub_command_text(sub)))   # `deploy --password "a b c"`, `... PASSWORD 'x'` go into path and CHANGES.md
             if kind:
                 # the explicit rule wins over the path heuristic for exec records
                 rec.cfg.setdefault("rules", []).insert(0, {"host": host, "path_regex": r".*", "kind": kind})

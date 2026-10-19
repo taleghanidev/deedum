@@ -248,6 +248,7 @@ class Recorder:
         self._auth_re = re.compile(self.cfg.get("auth_path_regex") or r"$^")
         self._scrub_re = re.compile(self.cfg.get("scrub_regex") or r"$^")
         self.argv = self.scrub_argv(scrub_argv_list(sys.argv))[:2000]   # list-aware first: a multiword secret stays whole
+        self._before = {}
 
     @property
     def why(self):
@@ -255,8 +256,22 @@ class Recorder:
         every call, so a reason set mid-session applies to the very next call)."""
         return self._why_arg or store.get_session_why(self.dir) or ""
 
-    def gate(self, method, host, path, body=None, transport="http"):
-        """Called before a request leaves. Returns a refusal reason, or None to let it go."""
+    def gate(self, method, host, path, body=None, transport="http", headers=None, origin=None):
+        """Called before a request leaves. Returns a refusal reason, or None to let it go. With
+        the live headers and the origin, a write to a `snapshot_hosts` host first reads the object
+        back (GET the same URL), so the record carries `before` and `deedum undo` has something
+        to restore."""
+        why_not = self._gate(method, host, path, body, transport)
+        if why_not:
+            return why_not
+        # cleared to go: now, and only now, the object may be read for `before` (a dry run or a
+        # refused write must not touch the service at all, not even with a GET)
+        if headers is not None and origin and method.upper() in ("PUT", "PATCH", "DELETE") \
+                and any(fnmatch.fnmatch((host or "").lower(), p) for p in self.cfg.get("snapshot_hosts", [])):
+            self._snapshot(method.upper(), host, path, headers, origin)
+        return None
+
+    def _gate(self, method, host, path, body, transport):
         kind = self.kind(method, host or "", path or "")
         gql = self._graphql_kind(body)
         if gql:
@@ -272,6 +287,23 @@ class Recorder:
         if not self.why and any(fnmatch.fnmatch((host or "").lower(), p) for p in self.cfg.get("require_why_hosts", [])):
             return f"deedum: writes to {host} need a reason (deedum run --why, or deedum why \"...\")"
         return self._policy(host, method, path, kind)
+
+    def _snapshot(self, method, host, path, headers, origin):
+        """GET the object a PUT/PATCH/DELETE is about to change, with the request's own
+        credentials, outside the hooks (never recorded, never recursive). Kept until record()."""
+        from . import readback
+        if not readback.resource_of({"transport": "http", "method": method, "host": host, "path": path})[0]:
+            return
+        _tl.inner = getattr(_tl, "inner", 0) + 1
+        try:
+            live = {k: (v.decode("latin-1") if isinstance(v, bytes) else str(v)) for k, v in dict(headers).items()
+                    if k.lower() not in readback._SKIP_H}
+            status, body = readback.http_call("GET", origin.rstrip("/") + path, live, timeout=15)
+            self._before[(method, host, path)] = {"status": status, "body": body}
+        except Exception as e:
+            self._before[(method, host, path)] = {"status": None, "error": f"{type(e).__name__}: {e}"[:300]}
+        finally:
+            _tl.inner -= 1
 
     def _policy(self, host, method, path, kind):
         """The policy file / config rules: refuse, hold for a person, or let go."""
@@ -329,9 +361,19 @@ class Recorder:
             v = v.decode("latin-1") if isinstance(v, bytes) else str(v)
             if k.lower() in self._redact_h or secret_name(k):
                 named = secrets_in(v)
-                # keep the scheme ("Bearer") and say which credential it was
-                scheme = v.split(" ", 1)[0] + " " if " " in v and len(v.split(" ", 1)[0]) < 12 else ""
-                out[k] = scheme + ("".join(store.secret_tag(n, sv) for sv, n in _secret_values() if n in named[:1]) if named else "<redacted>")
+                if named:
+                    # every known secret value becomes its tag IN PLACE, so the header keeps its
+                    # shape (`Bearer <tag>`, `sid=<tag>; theme=dark`, `Token token=<tag>`) and
+                    # can be rebuilt by name for a readback
+                    v2 = v
+                    for sv, n in _secret_values():
+                        if sv in v2:
+                            v2 = v2.replace(sv, store.secret_tag(n, sv))
+                    out[k] = scrub_values(v2)
+                else:
+                    # keep the scheme ("Bearer") and redact the rest
+                    scheme = v.split(" ", 1)[0] + " " if " " in v and len(v.split(" ", 1)[0]) < 12 else ""
+                    out[k] = scheme + "<redacted>"
             else:
                 out[k] = v[:500]
         return out
@@ -353,8 +395,9 @@ class Recorder:
     _jsonkey_re = re.compile(r'(?i)("(?:[^"]*(?:token|secret|password|passwd|key|authorization|credential)[^"]*)"\s*:\s*)"[^"]*"')
     _hdr_re = re.compile(r"(?i)((?:authorization|developertoken|developer-token|x-api-key|api-key|apikey|cookie|x-auth-token|authenticationtoken)\s*:\s*)[^\s'\"]+(?:\s+[^\s'\"]+)?")
 
-    _flag_re = re.compile(r"(?i)(\s(?:-u|--user|--proxy-user|--oauth2-bearer|--tlsuser|--tlspassword|--token|--password|--passwd|--secret|--api-key|--apikey|"
-                          r"--client-secret|--secret-string|--secret-binary|--private-key|--access-key|--secret-access-key|--session-token|--auth-token|--bearer|--key-file|--sshpass)[= ])\S+")
+    # `-u` only in lower case: curl's -u is user:password, psql's -U is a user name
+    _flag_re = re.compile(r"(\s(?:-u|(?i:--user|--proxy-user|--oauth2-bearer|--tlsuser|--tlspassword|--token|--password|--passwd|--secret|--api-key|--apikey|"
+                          r"--client-secret|--secret-string|--secret-binary|--private-key|--access-key|--secret-access-key|--session-token|--auth-token|--bearer|--key-file|--sshpass))[= ])\S+")
 
     def scrub_argv(self, text):
         text = self._flag_re.sub(lambda m: m.group(1) + "<redacted>", text)
@@ -447,7 +490,8 @@ class Recorder:
             "agent": self.agent, "via": rec.get("via") or ("script" if rec["transport"] in ("http", "grpc") else rec["transport"]),
             "service": store.service_of(host, self.cfg), "secrets": used or None,
             "transport": rec["transport"], "method": rec["method"], "host": rec.get("host"),
-            "path": rec.get("path"), "query": rec.get("query") or None,
+            "origin": rec.get("origin"), "path": rec.get("path"), "query": rec.get("query") or None,
+            "before": self._before_for(rec),
             "request": {"headers": self.redact_headers(rec.get("req_headers")),
                         "body": self.body(rec.get("req_body"), req_lim)},
             "status": rec.get("status"),
@@ -469,6 +513,15 @@ class Recorder:
                     f"- {ts[:16].replace('T', ' ')} · {proj}{out['service']} · {out['method']} {out['host']}{out['path']} · {status}{whys} · `{rid}`"))
             else:
                 self.reads += 1
+
+    def _before_for(self, rec):
+        snap = self._before.pop((rec["method"].upper(), rec.get("host"), rec.get("path")), None)
+        if not snap:
+            return None
+        if "body" in snap:
+            body = snap["body"]
+            snap = dict(snap, body=self.body(json.dumps(body) if not isinstance(body, str) else body, self.cfg["write_response_max"]))
+        return snap
 
     def finish(self, exit_code=None, started=None):
         for f in list(_pending):   # responses never read nor closed: recorded now, before the counts
@@ -494,6 +547,18 @@ def _split(url):
     u = urlsplit(url)
     return u.hostname or "", u.path or "/", dict(parse_qsl(u.query)) if u.query else None
 
+
+def _origin(url):
+    """scheme://host[:port] of a URL (the port only when it is not the scheme's default)."""
+    try:
+        u = urlsplit(url)
+        if not u.hostname:
+            return None
+        port = u.port
+        return f"{u.scheme}://{u.hostname}" + (f":{port}" if port and port not in (80, 443) else "")
+    except Exception:
+        return None
+
 def _hook_requests(rec):
     try:
         import requests
@@ -504,7 +569,7 @@ def _hook_requests(rec):
         return True
     def send(self, request, **kw):
         host, path, q = _split(request.url)
-        why_not = rec.gate(request.method.upper(), host, path, request.body)
+        why_not = rec.gate(request.method.upper(), host, path, request.body, headers=request.headers, origin=_origin(request.url))
         if why_not:
             raise rec.blocked("http", request.method.upper(), host, path, q, dict(request.headers), request.body, why_not)
         t0 = time.time(); resp = None; err = None
@@ -518,7 +583,7 @@ def _hook_requests(rec):
         finally:
             _tl.inner -= 1
             try:
-                rec.record({"transport": "http", "method": request.method.upper(), "host": host,
+                rec.record({"transport": "http", "method": request.method.upper(), "host": host, "origin": _origin(request.url),
                             "path": path, "query": q, "req_headers": dict(request.headers),
                             "req_body": request.body,
                             "status": resp.status_code if resp is not None else None,
@@ -561,7 +626,7 @@ def _hook_httpx(rec):
                         body = resp.content
                     except Exception:
                         body = None
-                rec.record({"transport": "http", "method": request.method.upper(), "host": host,
+                rec.record({"transport": "http", "method": request.method.upper(), "host": host, "origin": _origin(str(request.url)),
                             "path": path, "query": q, "req_headers": dict(request.headers),
                             "req_body": _httpx_content(request), "status": resp.status_code if resp is not None else None,
                             "resp_body": body, "ms": int((time.time() - t0) * 1000), "error": err})
@@ -569,7 +634,7 @@ def _hook_httpx(rec):
                 sys.stderr.write(f"[deedum] record failed: {e}\n")
         def check(request):
             host, path, q = _split(str(request.url))
-            why_not = rec.gate(request.method.upper(), host, path, _httpx_content(request))
+            why_not = rec.gate(request.method.upper(), host, path, _httpx_content(request), headers=request.headers, origin=_origin(str(request.url)))
             if why_not:
                 raise rec.blocked("http", request.method.upper(), host, path, q, dict(request.headers), _httpx_content(request), why_not)
         if is_async:
@@ -615,11 +680,11 @@ def _hook_urllib(rec):
     def open_(self, fullurl, data=None, timeout=None):
         req = fullurl if isinstance(fullurl, ur.Request) else ur.Request(fullurl, data=data)
         h0, p0, q0 = _split(req.full_url)
-        why_not = rec.gate(req.get_method().upper(), h0, p0, data if data is not None else req.data)
+        why_not = rec.gate(req.get_method().upper(), h0, p0, data if data is not None else req.data, headers=dict(req.header_items()), origin=_origin(req.full_url))
         if why_not:
             raise rec.blocked("http", req.get_method().upper(), h0, p0, q0, dict(req.header_items()), data if data is not None else req.data, why_not)
         t0 = time.time()
-        base = {"transport": "http", "method": req.get_method().upper(), "host": h0, "path": p0, "query": q0,
+        base = {"transport": "http", "method": req.get_method().upper(), "host": h0, "origin": _origin(req.full_url), "path": p0, "query": q0,
                 "req_headers": dict(req.header_items()), "req_body": req.data}
         _tl.ul = getattr(_tl, "ul", 0) + 1  # the http.client hook underneath skips this call
         try:
@@ -734,6 +799,12 @@ class _Tap:
 _tl = threading.local()
 
 
+def _hc_origin(conn):
+    scheme = "https" if "HTTPS" in type(conn).__name__ else "http"
+    port = getattr(conn, "port", None)
+    return f"{scheme}://{conn.host}" + (f":{port}" if port and port not in (80, 443) else "")
+
+
 def _hook_http_client(rec):
     """The catch-all: http.client is under urllib, urllib3 (requests, botocore) and httplib2
     (google-api-python-client, which the Google Sheets / Search Console / YouTube clients use).
@@ -751,11 +822,13 @@ def _hook_http_client(rec):
             return orig_request(self, method, url, body, headers or {}, *a, **kw)
         path, _, qs = (url or "/").partition("?")
         query = dict(parse_qsl(qs)) if qs else None
-        why_not = rec.gate(method.upper(), self.host, path, body if isinstance(body, (bytes, str)) else None)
+        origin = _hc_origin(self)
+        why_not = rec.gate(method.upper(), self.host, path, body if isinstance(body, (bytes, str)) else None,
+                           headers=dict(headers or {}), origin=origin)
         if why_not:
             raise rec.blocked("http", method.upper(), self.host, path, query, dict(headers or {}),
                               body if isinstance(body, (bytes, str)) else None, why_not)
-        self._deedum_req = {"method": method.upper(), "host": self.host, "path": path or "/", "query": query,
+        self._deedum_req = {"method": method.upper(), "host": self.host, "origin": origin, "path": path or "/", "query": query,
                             "req_headers": dict(headers or {}),
                             "req_body": body if isinstance(body, (bytes, str)) else None, "t0": time.time()}
         try:
@@ -794,10 +867,10 @@ def _hook_http_client(rec):
             path, _, qs = (low["url"] or "/").partition("?")
             query = dict(parse_qsl(qs)) if qs else None
             body = message_body if isinstance(message_body, (bytes, str)) else None
-            why_not = rec.gate(low["method"].upper(), self.host, path, body)
+            why_not = rec.gate(low["method"].upper(), self.host, path, body, headers=low["headers"], origin=_hc_origin(self))
             if why_not:
                 raise rec.blocked("http", low["method"].upper(), self.host, path, query, low["headers"], body, why_not)
-            self._deedum_req = {"method": low["method"].upper(), "host": self.host, "path": path or "/", "query": query,
+            self._deedum_req = {"method": low["method"].upper(), "host": self.host, "origin": _hc_origin(self), "path": path or "/", "query": query,
                                 "req_headers": low["headers"], "req_body": body, "t0": time.time()}
         return orig_endheaders(self, message_body, **kw)
 
@@ -926,11 +999,11 @@ def _hook_aiohttp(rec):
                 body = None
         body = body if isinstance(body, (bytes, str)) else None
         headers = dict(kw.get("headers") or {})
-        why_not = rec.gate(method.upper(), host, path, body)
+        why_not = rec.gate(method.upper(), host, path, body, headers=headers, origin=_origin(url))
         if why_not:
             raise rec.blocked("http", method.upper(), host, path, q, headers, body, why_not)
         t0 = time.time()
-        base_rec = {"transport": "http", "method": method.upper(), "host": host, "path": path, "query": q,
+        base_rec = {"transport": "http", "method": method.upper(), "host": host, "origin": _origin(url), "path": path, "query": q,
                     "req_headers": headers, "req_body": body}
         try:
             resp = await orig(self, method, str_or_url, **kw)
@@ -997,7 +1070,8 @@ def _hook_urllib3(rec):
         u = urlsplit(url) if "://" in url else None
         path = (u.path if u else url.split("?", 1)[0]) or "/"
         query = dict(parse_qsl(u.query if u else (url.split("?", 1)[1] if "?" in url else ""))) or None
-        why_not = rec.gate(method.upper(), host, path, body)
+        origin = f"{getattr(self, 'scheme', 'http')}://{host}" + (f":{self.port}" if getattr(self, "port", None) and self.port not in (80, 443) else "")
+        why_not = rec.gate(method.upper(), host, path, body, headers=dict(headers or {}), origin=origin)
         if why_not:
             raise rec.blocked("http", method.upper(), host, path, query, dict(headers or {}), body, why_not)
         t0 = time.time(); resp = None; err = None
@@ -1013,7 +1087,7 @@ def _hook_urllib3(rec):
                 data = None
                 if resp is not None and kw.get("preload_content", True):
                     data = getattr(resp, "data", None)
-                rec.record({"transport": "http", "method": method.upper(), "host": host, "path": path,
+                rec.record({"transport": "http", "method": method.upper(), "host": host, "origin": origin, "path": path,
                             "query": query, "req_headers": dict(headers or {}),
                             "req_body": body if isinstance(body, (bytes, str)) else None,
                             "status": getattr(resp, "status", None), "resp_body": data,

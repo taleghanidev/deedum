@@ -38,6 +38,7 @@ deedum html --out changes.html                         # the same as one self-co
 - [Secrets: named, never stored](#secrets-named-never-stored)
 - [Dry runs and guards](#dry-runs-and-guards)
 - [Policy: deny, approve, budgets](#policy-deny-approve-budgets)
+- [After a change: verify, diff, undo](#after-a-change-verify-diff-undo)
 - [For coding agents](#for-coding-agents)
 - [Reading the trail](#reading-the-trail)
 - [The trail on disk, and keeping it small](#the-trail-on-disk-and-keeping-it-small)
@@ -57,7 +58,7 @@ No code changes. Hooks travel through the environment into every process a shell
 | **Python** | `requests`, `httpx`, `urllib`, `urllib3` (botocore / the AWS SDK), `http.client` underneath everything (so `httplib2` and google-api-python-client: Sheets, Search Console, YouTube, Business Profile), `aiohttp`, and **gRPC** (Google Ads, Google Cloud clients) |
 | **Node** | `fetch` and `http`/`https` (axios, got, the Stripe and AWS SDKs, Next.js server code) |
 | **curl** | a shim on PATH records the call (`-K` config files and `--next` segments included) and passes everything through unchanged |
-| **Binaries** | `ssh`, `scp`, `sftp`, `rsync`, `aws` (SSM included), `gh`, `wrangler`, `terraform`, `kubectl`, `helm`, `gcloud`, `az`, `flyctl`, `vercel`, `netlify`, `heroku`, `doctl`, `stripe` and `git push` go through a shim of the same name that records the command as a call (tool, subcommand, target host or profile, exit code, scrubbed argv) and runs the real one with the same tty, so interactive ssh works unchanged |
+| **Binaries** | `ssh`, `scp`, `sftp`, `rsync`, `aws` (SSM included), `gh`, `wrangler`, `terraform`, `kubectl`, `helm`, `gcloud`, `az`, `flyctl`, `vercel`, `netlify`, `heroku`, `doctl`, `stripe`, `git push`, and the database and container clients `psql`, `mysql`, `mariadb`, `redis-cli`, `mongosh`, `docker`, `podman` go through a shim of the same name that records the command as a call (tool, subcommand or SQL, target host or profile, exit code, scrubbed argv) and runs the real one with the same tty, so interactive ssh and psql work unchanged. An interactive database session is recorded as opened, not what is typed into it |
 | **GraphQL** | classified by operation: a `mutation` is a write, a `query` is a read, `operationName` picks the one that runs |
 | **Anything else** | a Go or Rust tool with no shim: `deedum run` still records the command, its reason and its exit code |
 
@@ -221,6 +222,30 @@ from the current folder, `--example` prints a template.
 
 With no policy anywhere, nothing changes.
 
+## After a change: verify, diff, undo
+
+For a REST object (a PUT, PATCH or DELETE on `/things/42`, or a POST that answered with an id):
+
+```
+deedum snapshot api.cloudflare.com      # once: read objects back before writes to this host
+deedum verify ID                        # GET the object, check the fields the write sent
+deedum diff ID                          # the before snapshot against the response; --now: against the object now
+deedum undo ID                          # show what putting the snapshot back would send; --yes sends it
+```
+
+- A snapshot is one GET of the same URL, with the request's own credentials, just before the
+  write and only once the write is cleared to go; it is kept on the record as `before`. Opt in
+  per host; a dry run or a refused write never snapshots. Python and curl today, Node next.
+- A readback or an undo uses the record's credential **by name** from your environment
+  (`<secret:STRIPE_SECRET_KEY#a1b2>` becomes `$STRIPE_SECRET_KEY`); the value is never stored.
+  Missing, and deedum says which variable to set.
+- `undo` puts the snapshot back with a PUT, re-creates a deleted object from its snapshot, or
+  deletes what a POST created. It shows the request and sends nothing without `--yes`; the undo
+  is recorded and gated like any write. A snapshot that holds redacted fields or was truncated
+  is never restored: it would overwrite real values with placeholders.
+- What cannot be read back generically (an RPC, a GraphQL mutation, a POST that is an action)
+  is reported as such, never guessed.
+
 ## For coding agents
 
 Nothing is generated per folder. The agent learns about deedum once, at install, in the places
@@ -302,6 +327,7 @@ write records the contact it created, a response holds whatever the service retu
 | `guide [--write] [--global]` | the short guide for coding agents: a project's AGENTS.md / CLAUDE.md, or every agent's global instructions |
 | `mcp-add` | register `deedum mcp` with Claude Code |
 | `log`, `show ID`, `report`, `html` | the trail, four ways |
+| `verify ID`, `diff ID [--now]`, `undo ID [--yes]`, `snapshot HOST` | read a change back, see what changed, put it back |
 | `projects`, `secrets`, `runs` | who called what, with which key, from which command |
 | `policy [--example]`, `approvals`, `approve ID`, `deny ID` | the rules in force; writes waiting for a person |
 | `guard HOST`, `ignore HOST`, `noise` | writes that need a reason; what not to record |
@@ -348,9 +374,10 @@ binary shims ship with it.
 
 ## Roadmap, contributing, licence
 
-Next: `deedum diff ID` / `deedum undo ID` for providers whose state can be read back (DNS,
-ads, Vercel); `deedum verify ID` to read a change back and confirm it stuck; a local proxy mode
-for runtimes without a hook or shim (Go, Ruby, Java); a shared timeline for a team.
+Next: provider-aware readback where REST is not enough (Google Ads mutations, GraphQL); a
+reason per write rather than per session; a local proxy mode for runtimes without a hook or shim
+(Go, Ruby, Java); a shared timeline for a team; a single native binary for the CLI and shims.
+`docs/` has the long guide for agents and the policy reference.
 
 MIT, see `LICENSE`. Contributions are welcome under the same terms: `CONTRIBUTING.md` has the
 setup and the rules (a test for every change, both runtimes kept in step, no dependencies,

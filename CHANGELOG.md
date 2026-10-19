@@ -40,6 +40,20 @@ The release that makes the trail safe to keep and complete enough to trust.
   Copilot), its session id, the model (from the transcript via the prompt hook), the person,
   the machine, the folder the session was started in — and `via` (`script`, `curl`, `exec`).
 
+### Read it back: verify, diff, undo
+- `deedum snapshot HOST`: before a PUT/PATCH/DELETE to the host, the object is read with the
+  request's own credentials and kept on the record as `before`. Records carry `origin`.
+- `deedum verify ID` reads the object back (credential by name from the environment) and checks
+  the fields the write sent; `deedum diff ID` shows before against the response or the object
+  now; `deedum undo ID --yes` puts the snapshot back, re-creates a deleted object, or deletes
+  what a POST created, recorded and gated like any write.
+- Shims for `psql`, `mysql`, `mariadb`, `redis-cli`, `mongosh`, `mongo`, `docker`, `podman`:
+  the SQL or command is the recorded subcommand, the server is the host; a one-shot read query
+  is a read, everything else (an interactive session included) a write.
+- `docs/for-agents.md` (the long guide for coding agents) and `docs/policy.md`.
+- Header redaction keeps the header's shape around a known secret (`sid=<tag>; theme=dark`), so
+  a readback can rebuild it by name; `-U` (a user name) is no longer mistaken for curl's `-u`.
+
 ### Control, not only a record
 - **Policy**: `.deedum-policy.json` in a repo or `policy` in config: `deny` (with `unless_why`),
   `approve` (the write waits for `deedum approve ID`, `deedum approvals` lists them, `notify`

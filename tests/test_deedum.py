@@ -311,7 +311,7 @@ def test_exec_shim_records_binaries():
     assert ensure_exec_shims(), BIN_DIR
     d = trail()
     fake = pathlib.Path(tempfile.mkdtemp())
-    for name in ("aws", "ssh", "git", "gh", "az", "gcloud", "doctl", "wrangler"):
+    for name in ("aws", "ssh", "git", "gh", "az", "gcloud", "doctl", "wrangler", "psql", "redis-cli", "docker", "mongosh"):
         f = fake / name
         # the fake git answers `config --get alias.X` like a repo with one alias, `ship -> push`
         # ... and in /other/repo (`-C /other/repo`) the alias `st` means push, not status
@@ -359,7 +359,10 @@ def test_exec_shim_records_binaries():
                 ["git", "-c", "alias.publish=push", "publish", "origin", "main"], ["git", "mystery-alias", "x"],
                 ["git", "-c", "alias.publish=ship", "publish", "origin", "main"], ["git", "ship", "origin"],
                 ["git", "-c", "alias.a=b", "-c", "alias.b=a", "a"], ["git", "-C", "/other/repo", "st"],
-                ["wrangler", "d1", "execute", "list", "--remote", "--command=DROP TABLE users"], ["wrangler", "kv", "key", "put", "list", "v"]):
+                ["wrangler", "d1", "execute", "list", "--remote", "--command=DROP TABLE users"], ["wrangler", "kv", "key", "put", "list", "v"],
+                ["psql", "-h", "db.example.com", "-c", "DELETE FROM users"], ["psql", "-h", "db.example.com", "-c", "select 1; drop table x"], ["psql", "-h", "db.example.com"],
+                ["psql", "-h", "db.example.com", "-f", "migrate.sql"], ["redis-cli", "-h", "cache.example.com", "FLUSHALL"], ["redis-cli", "SET", "k", "v"],
+                ["docker", "run", "--rm", "img"], ["docker", "exec", "c", "sh"], ["docker", "push", "img"], ["mongosh", "--eval", "db.users.deleteMany({})"]):
         out = run(d, *cmd, extra=["--dry"], PATH=path)
         assert out.returncode == 7 and "fake-" not in out.stdout, cmd
     for cmd in (["aws", "logs", "describe-log-groups"], ["ssh", "box.example.com", "ls -la /data"], ["gh", "api", "repos/a/b"],
@@ -368,9 +371,14 @@ def test_exec_shim_records_binaries():
                 ["aws", "--profile", "prod", "s3", "ls"], ["aws", "--region=us-east-1", "ec2", "describe-instances"],
                 ["aws", "ssm", "describe-instance-information"], ["aws", "lambda", "list-functions"],
                 ["ssh", "-o", "StrictHostKeyChecking=no", "-i", "/k", "-p", "22", "box.example.com", "uptime"],
-                ["wrangler", "kv", "key", "list", "--namespace-id=x"], ["wrangler", "d1", "list"]):
+                ["wrangler", "kv", "key", "list", "--namespace-id=x"], ["wrangler", "d1", "list"],
+                ["psql", "-h", "db.example.com", "-c", "SELECT count(*) FROM users"], ["psql", "-h", "db.example.com", "-c", "\\dt"],
+                ["redis-cli", "-h", "cache.example.com", "GET", "k"], ["redis-cli", "INFO"], ["docker", "ps"], ["docker", "logs", "c"], ["docker", "image", "ls"],
+                ["mongosh", "--eval", "db.users.find({})"]):
         out = run(d, *cmd, extra=["--dry"], PATH=path)
         assert out.returncode == 0 and "fake-" in out.stdout, (cmd, out.stderr)
+    out = run(d, "psql", "-h", "db.example.com", "-U", "app", "-c", "DELETE FROM users WHERE id=1", PATH=path)
+    pg = [x for x in records(d) if x["method"] == "PSQL"][-1]; assert pg["host"] == "db.example.com" and pg["kind"] == "write" and "DELETE FROM users" in pg["path"], pg
     out = run(d, "aws", "iam", "delete-login-profile", "--user-name", "alice", PATH=path)   # "login" is not an HTTP credential exchange here
     lp = [r for r in records(d) if r["path"] == "/iam delete-login-profile"]
     assert lp and lp[0]["kind"] == "write" and "delete-login-profile" in (d / "CHANGES.md").read_text(), lp
@@ -655,6 +663,107 @@ def test_mcp_and_html():
     p = cli(d, "html", "--out", str(out_html)); assert p.returncode == 0, p.stderr
     page = out_html.read_text()
     assert "<!doctype html>" in page and "/v1/m" in page and "mcp test" in page and "<script" not in page and "http" not in page.split("<body>")[0].replace("http-equiv", "")
+
+
+
+
+# ---- read it back: snapshot, verify, diff, undo ------------------------------------------------
+class Store(BaseHTTPRequestHandler):
+    """A tiny REST service: PUT/GET/DELETE /items/<id>, POST /items creates one with an id."""
+    items = {}
+    def _send(self, code, obj=None):
+        body = json.dumps(obj).encode() if obj is not None else b""
+        self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0)); return json.loads(self.rfile.read(n) or b"null")
+    gets = 0
+    def do_GET(self):
+        Store.gets += 1
+        k = self.path.rsplit("/", 1)[-1]
+        self._send(200, Store.items[k]) if k in Store.items else self._send(404, {"error": "no such item"})
+    def do_PUT(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items[k] = self._body(); self._send(200, Store.items[k])
+    def do_PATCH(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items.setdefault(k, {}).update(self._body()); self._send(200, Store.items[k])
+    def do_DELETE(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items.pop(k, None); self._send(204)
+    def do_POST(self):
+        if self.path.endswith("/actions"):
+            self._body(); self._send(200, {"ok": True}); return   # an action, not a creation: no id
+        new = {"id": str(len(Store.items) + 100), **self._body()}; Store.items[new["id"]] = new; self._send(201, new)
+    def log_message(self, *a): pass
+
+
+def test_snapshot_verify_diff_undo():
+    srv = HTTPServer(("127.0.0.1", 0), Store); threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"; d = trail()
+    Store.items.clear(); Store.items["1"] = {"name": "old", "price": 10}
+    assert cli(d, "snapshot", "127.0.0.1").returncode == 0
+    secret = "tok" + "9" * 20
+    # PUT with a bearer the record knows by NAME: the snapshot is taken with the same credential
+    py = f"import urllib.request as u; u.urlopen(u.Request('{base}/items/1', data=b'{{\"name\":\"new\",\"price\":12}}', method='PUT', headers={{'Authorization':'Bearer {secret}','Content-Type':'application/json'}})).read()"
+    out = run(d, sys.executable, "-c", py, why="rename item 1", SHOP_TOKEN=secret); assert out.returncode == 0, out.stderr
+    r = [x for x in records(d) if x["method"] == "PUT"][0]
+    assert r["origin"] == base and r["before"]["status"] == 200 and r["before"]["body"]["_json"] == {"name": "old", "price": 10}, r.get("before")
+    assert secret not in json.dumps(r) and r["request"]["headers"]["Authorization"].startswith("Bearer <secret:SHOP_TOKEN#")
+    rid = r["id"]
+    # verify: the fields the write sent are on the object now
+    env = clean_env(PYTHONPATH=str(ROOT), SHOP_TOKEN=secret)
+    v = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "verify", rid], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert v.returncode == 0 and "2 of 2 fields confirmed" in v.stdout, v.stdout + v.stderr
+    v = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "verify", rid], env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True, cwd=ROOT)
+    assert v.returncode != 0 and "SHOP_TOKEN" in v.stderr   # the credential is not stored: it must come from the environment
+    Store.items["1"]["price"] = 99   # someone changed it since
+    v = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "verify", rid], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert v.returncode == 1 and "DIFFERS price" in v.stdout, v.stdout
+    # diff: before -> response, and before -> now
+    df = cli(d, "diff", rid); assert df.returncode == 0 and "~ name" in df.stdout and '"old" -> "new"' in df.stdout, df.stdout + df.stderr
+    df = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "diff", rid, "--now"], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert "99" in df.stdout, df.stdout
+    # undo: shows the plan, sends only with --yes, is itself recorded and gated
+    u = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "undo", rid], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert u.returncode == 0 and "nothing sent" in u.stdout and Store.items["1"]["name"] == "new", u.stdout
+    u = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "undo", rid, "--yes"], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert u.returncode == 0 and Store.items["1"] == {"name": "old", "price": 10}, u.stdout + u.stderr
+    assert [x for x in records(d) if x.get("via") == "undo"][0]["why"].startswith(f"undo {rid}")
+    # a POST that created something: undo deletes it; DELETE with a snapshot: undo puts it back
+    out = run(d, "curl", "-s", "-X", "POST", f"{base}/items", "-H", "Content-Type: application/json", "-d", '{"name":"made"}', why="create")
+    cr = [x for x in records(d) if x["method"] == "POST"][0]; new_id = cr["response"]["body"]["_json"]["id"]; assert new_id in Store.items
+    u = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "undo", cr["id"], "--yes"], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert u.returncode == 0 and new_id not in Store.items, u.stdout + u.stderr
+    out = run(d, "curl", "-s", "-X", "DELETE", f"{base}/items/1", why="drop it")
+    dr = [x for x in records(d) if x["method"] == "DELETE" and x.get("via") == "curl"][0]
+    assert dr["before"]["body"]["_json"] == {"name": "old", "price": 10} and "1" not in Store.items
+    v = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "verify", dr["id"]], env=env, capture_output=True, text=True, cwd=ROOT); assert "deleted: yes" in v.stdout
+    u = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "undo", dr["id"], "--yes"], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert u.returncode == 0 and Store.items["1"] == {"name": "old", "price": 10}, u.stdout + u.stderr
+    # not readable back: an RPC-style POST without an id
+    out = run(d, "curl", "-s", "-X", "POST", f"{base}/items/1/actions", "-d", "{}", why="act")
+    ar = [x for x in records(d) if x["path"].endswith("/actions")][0]
+    v = cli(d, "verify", ar["id"]); assert v.returncode == 2 and "nothing to read back" in v.stdout
+    # a dry run never snapshots nor sends: the service sees no GET at all
+    Store.gets = 0
+    out = run(d, "curl", "-s", "-X", "PUT", f"{base}/items/1", "-d", "{}", extra=["--dry"]); assert out.returncode == 7
+    out = run(d, sys.executable, "-c", f"import urllib.request as u; u.urlopen(u.Request('{base}/items/1', data=b'{{}}', method='DELETE'))", extra=["--dry"]); assert out.returncode != 0
+    assert Store.gets == 0, Store.gets
+    # headers keep their shape around a known secret, so a readback can rebuild them
+    py = f"import urllib.request as u; u.urlopen(u.Request('{base}/items/1', data=b'{{\"name\":\"c\"}}', method='PUT', headers={{'Cookie':'sid={secret}; theme=dark','X-Api-Key':'v1.{secret}','Content-Type':'application/json'}})).read()"
+    out = run(d, sys.executable, "-c", py, why="cookie", SHOP_TOKEN=secret); assert out.returncode == 0, out.stderr
+    h = {k.lower(): v for k, v in [x for x in records(d) if x["method"] == "PUT"][-1]["request"]["headers"].items()}   # urllib re-cases header names
+    assert h["cookie"].startswith("sid=<secret:SHOP_TOKEN#") and h["cookie"].endswith("; theme=dark") and h["x-api-key"].startswith("v1.<secret:SHOP_TOKEN#"), h
+    from deedum.readback import fill_secrets, resource_of
+    filled, missing = fill_secrets(h, {"SHOP_TOKEN": secret})
+    assert filled["cookie"] == f"sid={secret}; theme=dark" and filled["x-api-key"] == f"v1.{secret}" and not missing
+    filled, missing = fill_secrets({"Authorization": "Basic <redacted>"}, {}); assert "Authorization" not in filled and missing and "<redacted>" in missing[0]
+    # an action on an existing object is not a creation; a label is not an id
+    assert resource_of({"transport": "http", "method": "POST", "host": "h", "origin": "https://h", "path": "/v1/invoices/in_1/pay", "response": {"body": {"_json": {"id": "in_1"}}}})[0] is None
+    assert resource_of({"transport": "http", "method": "POST", "host": "h", "origin": "https://h", "path": "/v1/users", "response": {"body": {"_json": {"name": "alice"}}}})[0] is None
+    # a snapshot with a redacted field is never restored
+    Store.items["7"] = {"name": "x", "api_key": "k" * 30}
+    out = run(d, "curl", "-s", "-X", "PUT", f"{base}/items/7", "-H", "Content-Type: application/json", "-d", '{"name":"y"}', why="edit 7")
+    r7 = [x for x in records(d) if x["path"] == "/items/7"][0]; assert r7["before"]["body"]["_json"]["api_key"] == "<redacted>"
+    u = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "undo", r7["id"], "--yes"], env=env, capture_output=True, text=True, cwd=ROOT)
+    assert u.returncode == 2 and "redacted" in u.stdout and Store.items["7"]["name"] == "y", u.stdout + u.stderr
 
 
 if __name__ == "__main__":

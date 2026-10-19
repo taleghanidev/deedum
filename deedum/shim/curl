@@ -171,7 +171,8 @@ def main():
                     continue
                 u = urlsplit(url_ if "://" in url_ else "http://" + url_)
                 path = u.path or "/"
-                why_not = rec.gate(m_ if m_ != "?" else "UNKNOWN", u.hostname or "", path, b_)
+                origin_ = f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port and u.port not in (80, 443) else "")
+                why_not = rec.gate(m_ if m_ != "?" else "UNKNOWN", u.hostname or "", path, b_, headers=h_, origin=origin_)
                 if why_not:
                     method, url, headers, body = m_, url_, h_, b_
                     break
@@ -257,6 +258,7 @@ def main():
                 u = urlsplit(url_ if "://" in url_ else "http://" + url_)
                 st = statuses[n] if n < len(statuses) else None
                 rec.record({"transport": "http", "via": "curl", "method": m_, "host": u.hostname or "",
+                    "origin": f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port and u.port not in (80, 443) else ""),
                     "path": u.path or "/", "query": dict(parse_qsl(u.query)) if u.query else None,
                     "req_headers": h_, "req_body": b_, "status": st, "resp_body": resp if len(segments) == 1 else None,
                     "ms": ms, "error": None if code == 0 else f"curl exit {code}"})

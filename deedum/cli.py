@@ -331,7 +331,8 @@ def _agent_from_hook(data):
 # of the same name on PATH records the command as a call and runs the real one. `git` is
 # recorded only for push and remote-changing subcommands (shim/_exec).
 EXEC_SHIMS = ["ssh", "scp", "sftp", "rsync", "aws", "gh", "wrangler", "terraform", "kubectl", "helm",
-              "gcloud", "az", "flyctl", "fly", "vercel", "netlify", "heroku", "doctl", "stripe", "git"]
+              "gcloud", "az", "flyctl", "fly", "vercel", "netlify", "heroku", "doctl", "stripe", "git",
+              "psql", "mysql", "mariadb", "redis-cli", "mongosh", "mongo", "docker", "podman"]
 
 
 def shim_wrapper(name):
@@ -1042,6 +1043,149 @@ def cmd_html(args):
     print(f"wrote {out} ({len(rows)} calls, {sum(1 for r in rows if r['kind'] == 'write')} writes)")
 
 
+# ---- read it back: verify, diff, undo ----------------------------------------------------------
+def _record(d, rid):
+    day = f"{rid[:4]}-{rid[4:6]}-{rid[6:8]}"
+    for r in store.iter_records(d, "calls", since=day, until=day):
+        if r["id"] == rid:
+            return r
+    sys.exit(f"no record {rid}")
+
+
+def _readback_target(r):
+    from . import readback
+    return readback.resource_of(r)
+
+
+def _creds(r):
+    from . import readback
+    headers, missing = readback.fill_secrets((r.get("request") or {}).get("headers"))
+    if missing:
+        sys.exit("cannot read back: " + "; ".join(f"{m} is not set in this environment (export it, then retry)" if not m.startswith("<") else m for m in missing))
+    return headers
+
+
+def cmd_verify(args):
+    """Read the changed object back from the service and check the fields the write sent."""
+    from . import readback
+    d = _dir(args); r = _record(d, args.id)
+    kind, url = _readback_target(r)
+    if not kind:
+        print(f"{args.id}: {url}"); sys.exit(2)
+    headers = _creds(r)
+    status, got = readback.http_call("GET", url, headers)
+    sent = readback.request_fields(r)
+    if args.json:
+        _out_json({"id": args.id, "url": url, "status": status, "object": got, "sent": sent}); return
+    print(f"{r['method']} {r['host']}{r['path']} ({r.get('why') or 'no reason'})\nread back: GET {url} -> {status}")
+    if r["method"] == "DELETE":
+        print("deleted: yes" if status in (404, 410) else f"deleted: NO, the object is still there ({status})")
+        sys.exit(0 if status in (404, 410) else 1)
+    if status >= 400:
+        print("the object could not be read"); sys.exit(1)
+    if sent is None:
+        print("the write sent no JSON fields to check; the object is above"); print(json.dumps(got, indent=1, ensure_ascii=False)[:4000]); return
+    matched, differing, absent = readback.compare(sent, got)
+    for k in matched:
+        print(f"  ok      {k} = {json.dumps(sent[k], ensure_ascii=False)[:120]}")
+    for k, (a, b) in differing.items():
+        print(f"  DIFFERS {k}: sent {json.dumps(a, ensure_ascii=False)[:100]}, service has {json.dumps(b, ensure_ascii=False)[:100]}")
+    for k in absent:
+        print(f"  absent  {k} (not in the read-back object; may be write-only or renamed)")
+    print(f"{len(matched)} of {len(sent)} fields confirmed" + (f", {len(differing)} differ" if differing else ""))
+    sys.exit(1 if differing else 0)
+
+
+def cmd_diff(args):
+    """What the write changed: the `before` snapshot against the object now (or the response)."""
+    from . import readback
+    d = _dir(args); r = _record(d, args.id)
+    before = (r.get("before") or {}).get("body")
+    before = before.get("_json") if isinstance(before, dict) and "_json" in before else before
+    if before is None:
+        print(f"{args.id}: no `before` snapshot (the host was not in snapshot_hosts when the write was made: deedum snapshot HOST)"); sys.exit(2)
+    kind, url = _readback_target(r)
+    if args.now and kind:
+        status, after = readback.http_call("GET", url, _creds(r))
+        src = f"the object now (GET {url} -> {status})"
+    else:
+        resp = (r.get("response") or {}).get("body") or {}
+        after = resp.get("_json") if isinstance(resp, dict) else None
+        src = "the write's response"
+        if r["method"] == "DELETE":
+            after = None; src = "nothing: it was deleted"
+    lines = readback.diff(before, after)
+    print(f"{r['method']} {r['host']}{r['path']} ({r.get('why') or 'no reason'})\nbefore (snapshot) -> {src}")
+    print("\n".join(lines) if lines else "  (no difference in the fields both sides have)")
+
+
+def cmd_undo(args):
+    """Put the `before` snapshot back (PUT), re-create a deleted object (PUT the snapshot to its
+    URL), or delete an object a POST created. Shows the request and stops without --yes."""
+    from . import readback
+    d = _dir(args); r = _record(d, args.id)
+    kind, url = _readback_target(r)
+    if not kind:
+        print(f"{args.id}: {url}"); sys.exit(2)
+    raw_before = (r.get("before") or {}).get("body")
+    before = raw_before.get("_json") if isinstance(raw_before, dict) and "_json" in raw_before else raw_before
+    if kind != "created" and raw_before is not None:
+        # the snapshot on the record is what the trail may hold: redacted and bounded. Restoring
+        # it would write "<redacted>" or a truncated blob over real fields, so it is refused.
+        if isinstance(raw_before, dict) and (raw_before.get("_truncated") or raw_before.get("_truncated_after") or "_text" in raw_before):
+            print(f"{args.id}: the snapshot is truncated ({raw_before.get('_bytes', '?')} bytes); a restore from it would be incomplete, not sent"); sys.exit(2)
+        if "<redacted>" in json.dumps(before):
+            print(f"{args.id}: the snapshot holds redacted credential fields; a restore would overwrite them with '<redacted>', not sent. Fields: "
+                  + ", ".join(k for k, v in (before.items() if isinstance(before, dict) else []) if "<redacted>" in json.dumps(v))); sys.exit(2)
+    if kind == "created":
+        plan = ("DELETE", url, None, f"delete {url}, which the POST created")
+    elif r["method"] in ("PUT", "PATCH", "DELETE"):
+        if before is None:
+            print(f"{args.id}: no `before` snapshot to restore (the host was not in snapshot_hosts: deedum snapshot HOST)"); sys.exit(2)
+        if (r.get("before") or {}).get("status") in (404, 410):
+            plan = ("DELETE", url, None, f"delete {url}: it did not exist before the write")
+        else:
+            plan = ("PUT", url, before, f"PUT the snapshot back to {url}")
+    else:
+        print(f"{args.id}: {r['method']} cannot be undone generically"); sys.exit(2)
+    method, url, body, what = plan
+    print(f"undo {args.id}: {what}")
+    if body is not None:
+        print(json.dumps(body, indent=1, ensure_ascii=False)[:4000])
+    if not args.yes:
+        print("\nnothing sent. Add --yes to send it (the undo is recorded like any write)."); return
+    headers = _creds(r)
+    from .recorder import Recorder
+    rec = Recorder(d, why=f"undo {args.id}: {what}")
+    host = r["host"]; path = "/" + url.split("://", 1)[1].split("/", 1)[1] if "/" in url.split("://", 1)[1] else "/"
+    why_not = rec.gate(method, host, path, json.dumps(body) if body is not None else None, headers=headers, origin=r.get("origin"))
+    if why_not:
+        rec.blocked("http", method, host, path, None, headers, json.dumps(body) if body is not None else None, why_not, via="undo")
+        sys.exit(why_not)
+    status, got = readback.http_call(method, url, headers, body)
+    rec.record({"transport": "http", "via": "undo", "method": method, "host": host, "origin": r.get("origin"), "path": path, "query": None,
+                "req_headers": headers, "req_body": json.dumps(body) if body is not None else None, "status": status,
+                "resp_body": json.dumps(got) if got is not None else None, "ms": 0, "error": None if status < 400 else f"HTTP {status}"})
+    print(f"{method} {url} -> {status}")
+    sys.exit(0 if status < 400 else 1)
+
+
+def cmd_snapshot(args):
+    """snapshot_hosts: before a PUT/PATCH/DELETE to these hosts, the object is read and kept."""
+    d = _dir(args)
+    cfg_path = d / "config.json"
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    lst = cfg.get("snapshot_hosts") or []
+    for h in args.hosts:
+        if args.remove:
+            lst = [x for x in lst if x != h]
+        elif h not in lst:
+            lst.append(h)
+    cfg["snapshot_hosts"] = lst
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    print("objects are snapshotted before writes to:", ", ".join(lst) or "(none)")
+
+
 def cmd_commit(args):
     d = _dir(args, required=not args.quiet)
     if d is None:
@@ -1143,6 +1287,14 @@ def main(argv=None):
     a = sp.add_parser("migrate", help="add project/folder/service to records made before 0.2"); a.set_defaults(f=cmd_migrate)
     a = sp.add_parser("status", help="where the trail is, its size, and what this shell records"); a.set_defaults(f=cmd_status)
     a = sp.add_parser("env", help="print the shell exports (setup --write installs them)"); a.set_defaults(f=cmd_env)
+    a = sp.add_parser("verify", help="read the changed object back and check the fields the write sent"); a.add_argument("id")
+    a.add_argument("--json", action="store_true"); a.set_defaults(f=cmd_verify)
+    a = sp.add_parser("diff", help="what a write changed: the before snapshot against the response (--now: against the object now)")
+    a.add_argument("id"); a.add_argument("--now", action="store_true"); a.set_defaults(f=cmd_diff)
+    a = sp.add_parser("undo", help="put the before snapshot back, or delete what a POST created; shows the request, sends with --yes")
+    a.add_argument("id"); a.add_argument("--yes", action="store_true"); a.set_defaults(f=cmd_undo)
+    a = sp.add_parser("snapshot", help="read objects back before writes to these hosts (needed by diff and undo)")
+    a.add_argument("hosts", nargs="+"); a.add_argument("--remove", action="store_true"); a.set_defaults(f=cmd_snapshot)
     a = sp.add_parser("mcp", help="serve the trail to an agent over MCP (stdio)"); a.set_defaults(f=cmd_mcp)
     a = sp.add_parser("approvals", help="writes waiting for a person (policy `approve` rules)"); a.add_argument("--all", action="store_true")
     a.add_argument("--json", action="store_true"); a.set_defaults(f=cmd_approvals)
