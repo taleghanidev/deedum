@@ -13,7 +13,10 @@
 #   3. runs `deedum setup --write`, which makes the trail (~/.deedum, its own git repo) and adds
 #      the capture block to ~/.zshenv / ~/.bashrc (coding-agent shells only; DEEDUM_ON=1 or
 #      --when always for every shell); with Claude Code installed, also its hooks
-#      (`deedum hook claude --write`: each prompt becomes the reason, the trail commits per turn)
+#      (`deedum hook claude --write`: each prompt becomes the reason, the trail commits per turn),
+#      writes the agent guide into every present agent's global instructions (`deedum guide
+#      --global`: ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md) and registers the
+#      MCP server with Claude Code (`deedum mcp-add`)
 #
 # Environment: DEEDUM_VERSION (a tag, default main), DEEDUM_SOURCE (a local checkout to install
 # from instead), DEEDUM_NO_SETUP=1 (skip step 3), DEEDUM_HOME_BIN (default ~/.local/bin).
@@ -66,6 +69,8 @@ if [ -z "${DEEDUM_NO_SETUP:-}" ]; then
   case "$SHELL_NAME" in bash) S=bash;; *) S=zsh;; esac
   "$BIN/$NAME" setup --write --shell "$S"
   if [ -d "$HOME/.claude" ]; then "$BIN/$NAME" hook claude --write; fi   # Claude Code: prompts become reasons, commit per turn
+  "$BIN/$NAME" guide --global                                             # the rules, in every present agent's global instructions
+  if command -v claude >/dev/null 2>&1; then "$BIN/$NAME" mcp-add; fi     # the trail as tools in Claude Code
   say ""
   say "done. Open a new terminal (or: source ~/.zshenv). Then:"
   say "  $NAME status                      # where the trail is, what this shell records"

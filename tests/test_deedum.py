@@ -619,6 +619,11 @@ def test_guide_and_claude_hook_write():
     (proj / "AGENTS.md").write_text("# mine\n\n" + (proj / "AGENTS.md").read_text())
     subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "guide", "--write"], cwd=proj, env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
     t = (proj / "AGENTS.md").read_text(); assert t.startswith("# mine") and t.count("<!-- deedum guide -->") == 1
+    home = pathlib.Path(tempfile.mkdtemp()); (home / ".claude").mkdir(); (home / ".codex").mkdir()
+    out = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "guide", "--global"], cwd=proj, env=clean_env(PYTHONPATH=str(ROOT), HOME=str(home)), capture_output=True, text=True)
+    assert out.returncode == 0 and (home / ".claude" / "CLAUDE.md").read_text().count("<!-- deedum guide -->") == 1 and (home / ".codex" / "AGENTS.md").exists() and not (home / ".gemini").exists(), out.stdout + out.stderr
+    out = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "guide", "--global"], cwd=proj, env=clean_env(PYTHONPATH=str(ROOT), HOME=str(home)), capture_output=True, text=True)
+    assert "unchanged" in out.stdout and (home / ".claude" / "CLAUDE.md").read_text().count("<!-- deedum guide -->") == 1
     settings = proj / "settings.json"; settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}, "theme": "dark"}))
     pre = proj / "pre.json"; pre.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "DEEDUM_DIR=x /opt/x/deedum commit -m hi || true"}]}]}}))
     out = cli(d, "hook", "claude", "--write", "--settings", str(pre)); assert "added UserPromptSubmit hooks" in out.stdout, out.stdout   # an older hand-written commit hook counts

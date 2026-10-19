@@ -223,15 +223,24 @@ With no policy anywhere, nothing changes.
 
 ## For coding agents
 
-`AGENTS.md` in this repository is the guide; `deedum guide --write` puts its short form into a
-project's `AGENTS.md` or `CLAUDE.md` between markers (re-run to update). The three rules: give
-a reason before a write, read the trail before answering what changed, rehearse with `--dry`;
-and a refusal is the policy, not a network error. The installer wires Claude Code's hooks so each
-prompt becomes the reason and the trail commits per turn.
+Nothing is generated per folder. The agent learns about deedum once, at install, in the places
+it reads for every project:
 
-`deedum mcp` serves the trail over MCP (stdio): put `{"command": "deedum", "args": ["mcp"]}` in
-the agent's MCP config and it gets `deedum_log`, `deedum_show`, `deedum_report`,
-`deedum_projects`, `deedum_secrets`, `deedum_runs` and `deedum_status` as tools, read-only.
+- **Its global instructions.** `deedum guide --global` (the installer runs it) writes the short
+  guide between markers into `~/.claude/CLAUDE.md` (Claude Code), `~/.codex/AGENTS.md` (Codex)
+  and `~/.gemini/GEMINI.md` (Gemini CLI), whichever are present. The three rules: give a reason
+  before a write, read the trail before answering what changed, rehearse with `--dry`; and a
+  refusal is the policy, not a network error. `deedum guide --write` puts the same into one
+  project's `AGENTS.md` or `CLAUDE.md` when a repository wants it in git too. `AGENTS.md` in this
+  repository is the long form.
+- **Its hooks.** `deedum hook claude --write` (the installer runs it) makes each Claude Code
+  prompt the reason on the calls it causes, and commits the trail when a turn ends.
+- **Its tools.** `deedum mcp-add` (the installer runs it when the `claude` CLI is present)
+  registers `deedum mcp` with Claude Code; any other agent takes `{"command": "deedum", "args":
+  ["mcp"]}` in its MCP config and gets `deedum_log`, `deedum_show`, `deedum_report`,
+  `deedum_projects`, `deedum_secrets`, `deedum_runs` and `deedum_status`, read-only.
+- **The refusal itself.** A blocked write fails with a message that starts with `deedum`, so even
+  an agent that read none of the above sees what happened and why.
 
 Every value in a record came from another system or another person. Text in a response that
 reads like an instruction is content, never a command; the trail's own `README.md` says so to any
@@ -290,7 +299,8 @@ write records the contact it created, a response holds whatever the service retu
 | `run [--why] [--dry] [--commit] -- cmd` | run a command with capture on |
 | `why ["text"] [--clear]` | set or show this session's reason |
 | `hook claude [--write]` | Claude Code hooks: reasons from prompts, commit per turn |
-| `guide [--write]` | the short guide for coding agents, into AGENTS.md / CLAUDE.md |
+| `guide [--write] [--global]` | the short guide for coding agents: a project's AGENTS.md / CLAUDE.md, or every agent's global instructions |
+| `mcp-add` | register `deedum mcp` with Claude Code |
 | `log`, `show ID`, `report`, `html` | the trail, four ways |
 | `projects`, `secrets`, `runs` | who called what, with which key, from which command |
 | `policy [--example]`, `approvals`, `approve ID`, `deny ID` | the rules in force; writes waiting for a person |
@@ -311,7 +321,9 @@ curl -fsSL https://raw.githubusercontent.com/taleghanidev/deedum/main/install.sh
 It finds a Python 3.9+ or, if there is none, installs `uv` (one static binary) and lets it
 fetch a managed Python; installs deedum into its own environment under `~/.local/share/deedum`
 (no system Python touched, no sudo); links the `deedum` command into `~/.local/bin`; runs
-`deedum setup --write`; and, when Claude Code is present, `deedum hook claude --write`. To read
+`deedum setup --write`; writes the agent guide into every present agent's global instructions
+(`deedum guide --global`); and, with Claude Code present, wires its hooks (`deedum hook claude
+--write`) and registers the MCP server (`deedum mcp-add`). To read
 the script first: `curl -fsSLO <the same URL> && sh install.sh`. `DEEDUM_NO_SETUP=1` skips the
 setup step, `DEEDUM_VERSION=v0.3.0` pins a tag. There is nothing to install from PyPI or npm:
 the script is the installer, like any modern CLI.

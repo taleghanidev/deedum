@@ -5,9 +5,11 @@
 **Renamed: docket is now deedum** (the deed, the thing done). Command `deedum`, module `deedum`,
 environment `DEEDUM_*`, trail folder `.deedum`, policy file `.deedum-policy.json`, shims in
 `~/.local/share/deedum/bin`. An existing `.docket` trail and `DOCKET_*` variables are still read,
-so nothing has to move. `deedum guide --write` puts the agent rules into a project's `AGENTS.md`;
-`deedum hook claude --write` merges the Claude Code hooks into `~/.claude/settings.json`; the
-installer does both.
+so nothing has to move. `deedum guide --write` puts the agent rules into a project's `AGENTS.md`, `--global` into every
+present agent's global instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
+`~/.gemini/GEMINI.md`); `deedum hook claude --write` merges the Claude Code hooks into
+`~/.claude/settings.json`; `deedum mcp-add` registers the MCP server with Claude Code; the
+installer does all of it.
 
 The release that makes the trail safe to keep and complete enough to trust.
 
