@@ -15,7 +15,21 @@ from memory. With a policy file it also decides what may leave the machine at al
 curl -fsSL https://raw.githubusercontent.com/taleghanidev/deedum/main/install.sh | sh
 ```
 
-One line, with or without Python on the machine. Then, from any folder:
+One line, with or without Python on the machine.
+
+Or let your coding agent do it. Paste this as one prompt into Claude Code, Codex, Cursor or
+whichever agent you use:
+
+```text
+Install deedum on this machine so every API call you make is recorded with its reason.
+Run: curl -fsSL https://raw.githubusercontent.com/taleghanidev/deedum/main/install.sh | sh
+Then run `deedum guide --global` so you and every other coding agent here learn the rules,
+and `deedum mcp-add` if you are Claude Code. Open a new shell, run `deedum status`, and
+show me the trail path. From now on, before any command that changes an external system,
+give the reason with `deedum run --why "<what and why>" -- <command>`.
+```
+
+Then, from any folder:
 
 ```
 deedum why "raise the brand campaign bids to $14"                     # the reason for this session's calls
