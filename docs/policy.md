@@ -76,11 +76,11 @@ session, else this terminal) or the same `deedum run`, and refuses the one that 
 ## Snapshots
 
 Separate from policy but related: `deedum snapshot HOST` lists hosts whose objects are read and
-kept (`before`) just ahead of each PUT, PATCH or DELETE made from Python or curl, using the
+kept (`before`) just ahead of each PUT, PATCH or DELETE made from Python, curl or Node `fetch`, using the
 request's own credentials, and only once the write is cleared to go (a dry run or a refused
 write touches nothing, not even with a GET). `deedum diff ID` and `deedum undo ID` need it. It
-costs one GET per write to those hosts. Writes made from Node record their `origin` but take no
-snapshot yet.
+costs one GET per write to those hosts. Writes made through Node's `http` module record their `origin` but take no
+snapshot (a synchronous hook cannot wait for one).
 
 ## What a policy does not do
 

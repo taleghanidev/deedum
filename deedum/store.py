@@ -263,6 +263,20 @@ def get_session_why(trail_dir):
     return get_session_state(trail_dir).get("why") or None
 
 
+def set_session_step(trail_dir, step, key=None):
+    """From an agent's PreToolUse hook: the tool call about to run (`Bash: python bids.py ...`),
+    so every record it causes names the step, not only the prompt. Keeps the why."""
+    f = _state_file(trail_dir, key)
+    try:
+        state = json.loads(f.read_text())
+    except Exception:
+        state = {}
+    if not state.get("why"):
+        return   # no session reason yet: a step alone is not a reason
+    state["agent"] = {**(state.get("agent") or {}), "step": step}
+    f.write_text(json.dumps(state))
+
+
 def set_session_why(trail_dir, why, key=None, agent=None):
     """Record the session's reason, and (from an agent's prompt hook) what is known about the
     agent: its name, session id, model, the folder it was started in. `why=None` clears it."""
@@ -304,6 +318,7 @@ def agent_context(trail_dir=None):
         out["machine"] = socket.gethostname()
     except Exception:
         pass
+    out["step"] = None
     if trail_dir is not None:
         hook = get_session_state(trail_dir).get("agent") or {}
         for k in ("name", "session", "model", "started_in"):
@@ -311,6 +326,7 @@ def agent_context(trail_dir=None):
                 out[k] = hook[k]
         if hook.get("model"):
             out["model"] = hook["model"]  # the transcript knows better than an env var
+        out["step"] = hook.get("step")    # the agent's tool call that caused this (PreToolUse hook)
     return out
 
 

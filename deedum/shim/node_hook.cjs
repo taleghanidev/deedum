@@ -66,6 +66,7 @@
       'raw.githubusercontent.com', 'cdn.jsdelivr.net', 'unpkg.com', 'metadata.google.internal'],
     require_why_hosts: [],
     services: {},
+    snapshot_hosts: [],
   }
   let cfg = DEFAULTS
   try {
@@ -396,6 +397,7 @@
     const hook = sessionState().agent || {}
     for (const k of ['name', 'session', 'model', 'started_in']) if (hook[k] && !out[k]) out[k] = hook[k]
     if (hook.model) out.model = hook.model
+    out.step = hook.step || null   // the agent's tool call that caused this (PreToolUse hook)
     return out
   }
   const AGENT = agentContext()
@@ -548,6 +550,7 @@
         agent: AGENT, via: 'script',
         service: serviceOf(host), secrets: used.length ? used : null,
         transport: 'http', method: r.method, host, origin: r.origin || null, path: r.path, query,
+        before: r.before ? (r.before.body != null ? { status: r.before.status, body: body(r.before.body, cfg.write_response_max) } : r.before) : null,
         request: { headers: redactHeaders(r.headers), body: body(reqBody, w ? cfg.write_request_max : cfg.read_request_max) },
         status: r.status ?? null,
         response: { body: body(respBody, w ? cfg.write_response_max : cfg.read_response_max) },
@@ -604,6 +607,19 @@
           record({ method, host, origin, path: p, query, headers, reqBody, status: 'BLOCKED', error: no, ms: 0 })
           throw new TypeError(no)
         }
+        // cleared to go: a write to a snapshot host first reads the object, with the request's
+        // own headers, through the ORIGINAL fetch (never recorded, never recursive)
+        let before = null
+        if (u && ['PUT', 'PATCH', 'DELETE'].includes(method) && (cfg.snapshot_hosts || []).some((g) => glob(g, host)) && /^[A-Za-z0-9_.:@=-]{1,128}$/.test(p.replace(/\/$/, '').split('/').pop() || '')) {
+          try {
+            const sh = {}
+            for (const [k, v] of Object.entries(headers)) if (!['content-length', 'content-type', 'transfer-encoding', 'host', 'connection'].includes(k.toLowerCase())) sh[k] = v
+            const r0 = await orig.call(this, url, { method: 'GET', headers: { Accept: 'application/json', ...sh } })
+            before = { status: r0.status, body: await r0.text() }
+          } catch (e) {
+            before = { status: null, error: String(e && e.message).slice(0, 300) }
+          }
+        }
         const t0 = Date.now()
         let resp
         try {
@@ -620,9 +636,9 @@
             resp
               .clone()
               .text()
-              .then((t) => record({ method, host, origin, path: p, query, headers, reqBody, status, respBody: t, ms }))
-              .catch(() => record({ method, host, origin, path: p, query, headers, reqBody, status, ms }))
-          } else record({ method, host, origin, path: p, query, headers, reqBody, status, ms })
+              .then((t) => record({ method, host, origin, path: p, query, headers, reqBody, status, respBody: t, ms, before }))
+              .catch(() => record({ method, host, origin, path: p, query, headers, reqBody, status, ms, before }))
+          } else record({ method, host, origin, path: p, query, headers, reqBody, status, ms, before })
         }
         return resp
       }

@@ -422,6 +422,61 @@ def test_exec_shim_records_binaries():
     assert "command · `git status`" in ch, ch   # a run that captured nothing still leaves its command line
 
 
+class Store(BaseHTTPRequestHandler):
+    """A tiny REST service: PUT/GET/DELETE /items/<id>, POST /items creates one with an id."""
+    items = {}
+    def _send(self, code, obj=None):
+        body = json.dumps(obj).encode() if obj is not None else b""
+        self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0)); return json.loads(self.rfile.read(n) or b"null")
+    gets = 0
+    def do_GET(self):
+        Store.gets += 1
+        k = self.path.rsplit("/", 1)[-1]
+        self._send(200, Store.items[k]) if k in Store.items else self._send(404, {"error": "no such item"})
+    def do_PUT(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items[k] = self._body(); self._send(200, Store.items[k])
+    def do_PATCH(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items.setdefault(k, {}).update(self._body()); self._send(200, Store.items[k])
+    def do_DELETE(self):
+        k = self.path.rsplit("/", 1)[-1]; Store.items.pop(k, None); self._send(204)
+    def do_POST(self):
+        if self.path.endswith("/actions"):
+            self._body(); self._send(200, {"ok": True}); return   # an action, not a creation: no id
+        new = {"id": str(len(Store.items) + 100), **self._body()}; Store.items[new["id"]] = new; self._send(201, new)
+    def log_message(self, *a): pass
+
+
+def test_node_snapshot_and_agent_step():
+    import shutil
+    if not shutil.which("node"):
+        return
+    srv = HTTPServer(("127.0.0.1", 0), Store); threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"; d = trail()
+    Store.items["n1"] = {"name": "old"}; cli(d, "snapshot", "127.0.0.1")
+    # the reason from the prompt hook, the step from the PreToolUse hook
+    env = clean_env(PYTHONPATH=str(ROOT), DEEDUM_SESSION="s7")
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-hook"], input=json.dumps({"session_id": "s7", "prompt": "rename n1"}), env=env, capture_output=True, text=True, cwd=ROOT)
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-tool"], input=json.dumps({"session_id": "s7", "tool_name": "Bash", "tool_input": {"command": "node rename.js --token sekret123456 n1"}}), env=env, capture_output=True, text=True, cwd=ROOT)
+    js = f"fetch('{base}/items/n1',{{method:'PUT',headers:{{'content-type':'application/json','x-api-key':'k'.repeat(20)}},body:JSON.stringify({{name:'new'}})}}).then(r=>r.text()).then(t=>console.log('got',t))"
+    out = run(d, "node", "-e", js, why="", DEEDUM_SESSION="s7"); assert out.returncode == 0 and "got" in out.stdout, out.stderr
+    import time; time.sleep(0.5)
+    r = [x for x in records(d) if x["path"] == "/items/n1"][0]
+    assert r["before"]["status"] == 200 and r["before"]["body"]["_json"] == {"name": "old"}, r.get("before")
+    assert r["why"] == "asked: rename n1" and r["agent"]["step"] == "Bash: node rename.js --token <redacted> n1", r["agent"]
+    assert Store.items["n1"] == {"name": "new"}
+    # dry run: no GET, nothing sent
+    Store.gets = 0
+    out = run(d, "node", "-e", js.replace("'new'", "'dry'"), extra=["--dry"]); time.sleep(0.3)
+    assert Store.gets == 0 and Store.items["n1"] == {"name": "new"}
+    assert "step: Bash: node rename.js" in cli(d, "log", "--writes").stdout
+    # hook claude --write adds the PreToolUse hook with a Bash matcher
+    settings = pathlib.Path(tempfile.mkdtemp()) / "s.json"; settings.write_text("{}")
+    cli(d, "hook", "claude", "--write", "--settings", str(settings))
+    data = json.loads(settings.read_text()); assert data["hooks"]["PreToolUse"][0]["matcher"] == "Bash" and "--from-claude-tool" in data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
 def test_node_http_response_body():
     import shutil
     if not shutil.which("node"):
@@ -634,7 +689,7 @@ def test_guide_and_claude_hook_write():
     assert "unchanged" in out.stdout and (home / ".claude" / "CLAUDE.md").read_text().count("<!-- deedum guide -->") == 1
     settings = proj / "settings.json"; settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}, "theme": "dark"}))
     pre = proj / "pre.json"; pre.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "DEEDUM_DIR=x /opt/x/deedum commit -m hi || true"}]}]}}))
-    out = cli(d, "hook", "claude", "--write", "--settings", str(pre)); assert "added UserPromptSubmit hooks" in out.stdout, out.stdout   # an older hand-written commit hook counts
+    out = cli(d, "hook", "claude", "--write", "--settings", str(pre)); assert "added UserPromptSubmit, PreToolUse hooks" in out.stdout, out.stdout   # an older hand-written commit hook counts
     out = cli(d, "hook", "claude", "--write", "--settings", str(settings)); assert out.returncode == 0 and "added" in out.stdout, out.stderr
     data = json.loads(settings.read_text())
     assert data["theme"] == "dark" and len(data["hooks"]["Stop"]) == 2 and any("why --from-claude-hook" in h["command"] for g in data["hooks"]["UserPromptSubmit"] for h in g["hooks"])
@@ -668,32 +723,6 @@ def test_mcp_and_html():
 
 
 # ---- read it back: snapshot, verify, diff, undo ------------------------------------------------
-class Store(BaseHTTPRequestHandler):
-    """A tiny REST service: PUT/GET/DELETE /items/<id>, POST /items creates one with an id."""
-    items = {}
-    def _send(self, code, obj=None):
-        body = json.dumps(obj).encode() if obj is not None else b""
-        self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def _body(self):
-        n = int(self.headers.get("Content-Length", 0)); return json.loads(self.rfile.read(n) or b"null")
-    gets = 0
-    def do_GET(self):
-        Store.gets += 1
-        k = self.path.rsplit("/", 1)[-1]
-        self._send(200, Store.items[k]) if k in Store.items else self._send(404, {"error": "no such item"})
-    def do_PUT(self):
-        k = self.path.rsplit("/", 1)[-1]; Store.items[k] = self._body(); self._send(200, Store.items[k])
-    def do_PATCH(self):
-        k = self.path.rsplit("/", 1)[-1]; Store.items.setdefault(k, {}).update(self._body()); self._send(200, Store.items[k])
-    def do_DELETE(self):
-        k = self.path.rsplit("/", 1)[-1]; Store.items.pop(k, None); self._send(204)
-    def do_POST(self):
-        if self.path.endswith("/actions"):
-            self._body(); self._send(200, {"ok": True}); return   # an action, not a creation: no id
-        new = {"id": str(len(Store.items) + 100), **self._body()}; Store.items[new["id"]] = new; self._send(201, new)
-    def log_message(self, *a): pass
-
-
 def test_snapshot_verify_diff_undo():
     srv = HTTPServer(("127.0.0.1", 0), Store); threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_port}"; d = trail()

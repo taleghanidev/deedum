@@ -249,7 +249,8 @@ deedum undo ID                          # show what putting the snapshot back wo
 
 - A snapshot is one GET of the same URL, with the request's own credentials, just before the
   write and only once the write is cleared to go; it is kept on the record as `before`. Opt in
-  per host; a dry run or a refused write never snapshots. Python and curl today, Node next.
+  per host; a dry run or a refused write never snapshots. Python, curl and Node `fetch`; the
+  Node `http` module records its origin but takes no snapshot (it has no way to wait for one).
 - A readback or an undo uses the record's credential **by name** from your environment
   (`<secret:STRIPE_SECRET_KEY#a1b2>` becomes `$STRIPE_SECRET_KEY`); the value is never stored.
   Missing, and deedum says which variable to set.
@@ -273,7 +274,9 @@ it reads for every project:
   project's `AGENTS.md` or `CLAUDE.md` when a repository wants it in git too. `AGENTS.md` in this
   repository is the long form.
 - **Its hooks.** `deedum hook claude --write` (the installer runs it) makes each Claude Code
-  prompt the reason on the calls it causes, and commits the trail when a turn ends.
+  prompt the reason on the calls it causes, puts the command Claude runs on each record as
+  `agent.step` (so a report says which step changed what, not only which prompt), and commits
+  the trail when a turn ends.
 - **Its tools.** `deedum mcp-add` (the installer runs it when the `claude` CLI is present)
   registers `deedum mcp` with Claude Code; any other agent takes `{"command": "deedum", "args":
   ["mcp"]}` in its MCP config and gets `deedum_log`, `deedum_show`, `deedum_report`,

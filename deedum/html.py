@@ -64,7 +64,7 @@ pre{{background:var(--chip);padding:8px;border-radius:4px;overflow:auto;max-heig
                 out.append(f"""<details><summary><span class="mut">{_esc(r['ts'][11:16])}</span> <b>{_esc(r.get('service') or r.get('host'))}</b>
 <span class="m">{_esc(r.get('method'))} {_esc(r.get('host'))}{_esc(r.get('path'))}</span> <span class="{cls}">{_esc(st if st is not None else r.get('error'))}</span>
 <span class="r">{_esc(r.get('via'))} · {_esc(', '.join(r.get('secrets') or []))} · {_esc(r['id'])}</span></summary>
-<div class="mut m">cwd {_esc(r.get('cwd'))}<br>argv {_esc((r.get('argv') or '')[:300])}</div>
+<div class="mut m">cwd {_esc(r.get('cwd'))}<br>argv {_esc((r.get('argv') or '')[:300])}{('<br>step ' + _esc((r.get('agent') or {}).get('step'))) if (r.get('agent') or {}).get('step') else ''}</div>
 <b>request</b><pre>{_esc(json.dumps((r.get('request') or {}).get('headers') or {}, ensure_ascii=False))}
 {_esc(_body((r.get('request') or {}).get('body')))}</pre>
 <b>response</b><pre>{_esc(_body((r.get('response') or {}).get('body')))}</pre></details>""")

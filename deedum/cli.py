@@ -281,6 +281,24 @@ def cmd_env(args):
 # ---- the reason ------------------------------------------------------------------------------
 def cmd_why(args):
     d = _dir(args)
+    if args.from_claude_tool:
+        # Claude Code PreToolUse hook (Bash): the command about to run becomes `agent.step` on
+        # the records it causes, under the prompt's reason. Prints nothing.
+        try:
+            data = json.load(sys.stdin)
+        except Exception:
+            return
+        ti = data.get("tool_input") or {}
+        text = ti.get("command") or ti.get("file_path") or ti.get("description") or json.dumps(ti)[:200]
+        from .recorder import scrub_prose, scrub_argv_list
+        try:
+            import shlex
+            text = scrub_argv_list(shlex.split(text)) if ti.get("command") else text
+        except ValueError:
+            pass
+        step = f"{data.get('tool_name', 'tool')}: {scrub_prose(' '.join(str(text).split()))[:200]}"
+        store.set_session_step(d, step, key=data.get("session_id"))
+        return
     if args.from_claude_hook:
         # Claude Code UserPromptSubmit hook: the user's request becomes the reason for every call
         # until the next request. Prints nothing (stdout would be added to the conversation).
@@ -370,12 +388,14 @@ def ensure_exec_shims():
 def cmd_hook(args):
     exe = shlex.quote(sys.argv[0] if os.path.isabs(sys.argv[0]) else "deedum")
     mine = {"UserPromptSubmit": {"type": "command", "command": f"{exe} why --from-claude-hook"},
+            "PreToolUse": {"type": "command", "command": f"{exe} why --from-claude-tool"},
             "Stop": {"type": "command", "command": f"{exe} commit -q"}}
-    cfg = {"hooks": {k: [{"hooks": [v]}] for k, v in mine.items()}}
+    cfg = {"hooks": {k: [{**({"matcher": "Bash"} if k == "PreToolUse" else {}), "hooks": [v]}] for k, v in mine.items()}}
     if not args.write:
         print("Add to ~/.claude/settings.json (merge with any hooks already there), or rerun with --write:\n")
         print(json.dumps(cfg, indent=2))
         print("\nUserPromptSubmit: each request you type becomes the reason on the calls it causes.")
+        print("PreToolUse (Bash): the command Claude runs becomes `agent.step` on the records it causes.")
         print("Stop: the trail is committed when Claude finishes a turn.")
         return
     f = pathlib.Path(os.path.expanduser(args.settings or "~/.claude/settings.json"))
@@ -387,13 +407,12 @@ def cmd_hook(args):
     added = []
     for event, h in mine.items():
         groups = hooks.setdefault(event, [])
-        tail = h["command"].split(" ", 1)[1]                  # "why --from-claude-hook" / "commit -q"
-        marker = tail.split(" ")[0]                           # a hook of ours, whatever its path, prefix or flags
-        present = any("deedum" in hh.get("command", "") and (f" {marker} " in hh.get("command", "") + " " or hh.get("command", "").endswith(f" {marker}"))
-                      and ("--from-claude-hook" in hh.get("command", "") if marker == "why" else True)
+        tail = h["command"].split(" ", 1)[1]                  # "why --from-claude-hook" / "why --from-claude-tool" / "commit -q"
+        key = tail if tail.startswith("why") else tail.split(" ")[0]   # the two why hooks differ by their flag
+        present = any("deedum" in hh.get("command", "") and (f" {key} " in hh.get("command", "") + " ")
                       for g in groups for hh in g.get("hooks", []))
         if not present:
-            groups.append({"hooks": [h]}); added.append(event)
+            groups.append({**({"matcher": "Bash"} if event == "PreToolUse" else {}), "hooks": [h]}); added.append(event)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(data, indent=2) + "\n")
     print(f"{f}: " + (f"added {', '.join(added)} hooks" if added else "deedum hooks already there"))
@@ -531,6 +550,8 @@ def _where(r):
 def _fmt_row(r):
     st = r["status"] if r.get("status") is not None else (r.get("error") or "")[:24]
     why = f"  why: {r['why'][:80]}" if r.get("why") else ""
+    step = (r.get("agent") or {}).get("step")
+    why += f"  step: {step[:60]}" if step else ""
     svc = r.get("service") or r.get("host")
     return (f"{r['ts'][:16].replace('T', ' ')}  {_where(r)[:28]:28}  {r['kind']:5} {r['method']:6} "
             f"{svc[:18]:18} {r['host']}{r['path']}  {st}{why}  `{r['id']}`")
@@ -1245,7 +1266,8 @@ def main(argv=None):
     a.add_argument("command", nargs=argparse.REMAINDER); a.set_defaults(f=cmd_run)
     a = sp.add_parser("why", help="set the reason for this session's calls (deedum why \"...\"), or show it")
     a.add_argument("text", nargs="*"); a.add_argument("--clear", action="store_true")
-    a.add_argument("--from-claude-hook", action="store_true", help=argparse.SUPPRESS); a.set_defaults(f=cmd_why)
+    a.add_argument("--from-claude-hook", action="store_true", help=argparse.SUPPRESS)
+    a.add_argument("--from-claude-tool", action="store_true", help=argparse.SUPPRESS); a.set_defaults(f=cmd_why)
     a = sp.add_parser("hook", help="agent hooks: reason from each request, commit after each turn")
     a.add_argument("agent", choices=["claude"]); a.add_argument("--write", action="store_true", help="merge into ~/.claude/settings.json")
     a.add_argument("--settings", help="another settings file"); a.set_defaults(f=cmd_hook)

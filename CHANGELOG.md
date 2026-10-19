@@ -41,6 +41,8 @@ The release that makes the trail safe to keep and complete enough to trust.
   the machine, the folder the session was started in — and `via` (`script`, `curl`, `exec`).
 
 ### Read it back: verify, diff, undo
+- Node `fetch` writes take the `before` snapshot too. Records carry `agent.step`: the command
+  the agent ran (Claude Code PreToolUse hook, Bash matcher), under the prompt's reason.
 - `deedum snapshot HOST`: before a PUT/PATCH/DELETE to the host, the object is read with the
   request's own credentials and kept on the record as `before`. Records carry `origin`.
 - `deedum verify ID` reads the object back (credential by name from the environment) and checks

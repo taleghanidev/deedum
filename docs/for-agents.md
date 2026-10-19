@@ -95,7 +95,7 @@ deedum undo ID          # show what putting it back would send; --yes sends it
 ```
 
 `diff` and `undo` need a `before` snapshot, which the person turns on per host with
-`deedum snapshot HOST` (taken for writes from Python and curl; not yet from Node). A readback
+`deedum snapshot HOST` (taken for writes from Python, curl and Node `fetch`; not from Node's `http` module). A readback
 uses the record's credential by name from your environment; if it is missing, or the credential
 was never known by name, deedum says so and stops rather than go out unauthenticated. An undo
 never sends a snapshot that holds redacted fields or was truncated: it would overwrite real
