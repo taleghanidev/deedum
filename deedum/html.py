@@ -1,4 +1,4 @@
-"""`docket html`: the trail as one self-contained HTML page: a timeline of writes grouped by
+"""`deedum html`: the trail as one self-contained HTML page: a timeline of writes grouped by
 day and reason, with the agent, project and service on each, and every call's redacted request
 and response one click away. No scripts from the network, no styles from the network: the
 file is complete on its own and safe to open from disk or to hand to someone."""
@@ -21,7 +21,7 @@ def _body(b):
     return str(b)[:20000]
 
 
-def render(rows, title="Docket", since=None):
+def render(rows, title="Deedum", since=None):
     writes = [r for r in rows if r.get("kind") == "write"]
     reads = len(rows) - len(writes)
     by_day = collections.OrderedDict()

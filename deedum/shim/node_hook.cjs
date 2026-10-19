@@ -1,10 +1,10 @@
-// docket Node hook. Loaded with NODE_OPTIONS="--require <this file>" by `docket run` / `docket env`.
+// deedum Node hook. Loaded with NODE_OPTIONS="--require <this file>" by `deedum run` / `deedum env`.
 // Records every fetch() and http/https request the process makes into the same trail, with the
 // same record shape, redaction and secret naming as the Python hooks. Every line of it is
 // defensive: a failure here is reported once on stderr and never reaches the program.
 'use strict'
 ;(() => {
-  if (!process.env.DOCKET_RUN) return
+  if (!process.env.DEEDUM_RUN) return
   let fs, path, os, crypto
   try {
     fs = require('node:fs')
@@ -19,17 +19,17 @@
     if (warned) return
     warned = true
     try {
-      process.stderr.write(`[docket] node hook: ${e && e.message ? e.message : e}\n`)
+      process.stderr.write(`[deedum] node hook: ${e && e.message ? e.message : e}\n`)
     } catch {}
   }
 
   // ---- where the trail is (same rules as store.find_dir) ------------------------------------
   function findDir() {
     const exp = (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p)
-    if (process.env.DOCKET_DIR) return path.resolve(exp(process.env.DOCKET_DIR))
+    if (process.env.DEEDUM_DIR) return path.resolve(exp(process.env.DEEDUM_DIR))
     let d = process.cwd()
     for (;;) {
-      const t = path.join(d, '.docket')
+      const t = path.join(d, '.deedum')
       try {
         const st = fs.statSync(t)
         if (st.isDirectory() && fs.existsSync(path.join(t, 'calls'))) return t
@@ -39,7 +39,7 @@
       if (up === d) break
       d = up
     }
-    const g = path.resolve(exp(process.env.DOCKET_HOME || '~/.docket'))
+    const g = path.resolve(exp(process.env.DEEDUM_HOME || '~/.deedum'))
     return fs.existsSync(path.join(g, 'calls')) ? g : null
   }
   const DIR = findDir()
@@ -100,7 +100,7 @@
     let d = cwd
     for (;;) {
       try {
-        const m = path.join(d, '.docket-project')
+        const m = path.join(d, '.deedum-project')
         if (fs.statSync(m).isFile()) {
           root = d
           name = fs.readFileSync(m, 'utf8').trim().split('\n')[0] || path.basename(d)
@@ -129,7 +129,7 @@
       d = up
     }
     if (!root) name = cwd === home ? '~' : path.basename(cwd)
-    name = process.env.DOCKET_PROJECT || name
+    name = process.env.DEEDUM_PROJECT || name
     let folder = null
     if (root) {
       const rel = path.relative(root, cwd)
@@ -366,8 +366,8 @@
     const sign = off >= 0 ? '+' : '-'
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${sign}${pad(Math.floor(Math.abs(off) / 60))}:${pad(Math.abs(off) % 60)}`
   }
-  const SESSION = (process.env.CLAUDE_CODE_SESSION_ID || process.env.DOCKET_SESSION || 'default').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
-  let RUN = process.env.DOCKET_RUN
+  const SESSION = (process.env.CLAUDE_CODE_SESSION_ID || process.env.DEEDUM_SESSION || 'default').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
+  let RUN = process.env.DEEDUM_RUN
   if (RUN === 'always')
     RUN = process.env.CLAUDE_CODE_SESSION_ID ? `session-${process.env.CLAUDE_CODE_SESSION_ID.slice(0, 8)}` : null
   RUN = RUN || crypto.randomBytes(4).toString('hex')
@@ -381,16 +381,16 @@
     }
   }
   function why() {
-    if (process.env.DOCKET_WHY) return scrubProse(process.env.DOCKET_WHY)
+    if (process.env.DEEDUM_WHY) return scrubProse(process.env.DEEDUM_WHY)
     return sessionState().why || ''
   }
   // Who is driving this process (same rules as store.agent_context).
   function agentContext() {
     const e = process.env
     const name = e.CLAUDECODE || e.CLAUDE_CODE_SESSION_ID ? 'claude-code' : e.CODEX_SANDBOX || e.CODEX_THREAD_ID ? 'codex'
-      : e.CURSOR_AGENT ? 'cursor' : e.GEMINI_CLI ? 'gemini-cli' : e.COPILOT_AGENT || e.GITHUB_COPILOT_CLI ? 'copilot' : e.DOCKET_AGENT || null
-    const out = { name, session: e.CLAUDE_CODE_SESSION_ID || e.CODEX_THREAD_ID || e.DOCKET_SESSION || null,
-      model: e.DOCKET_MODEL || e.ANTHROPIC_MODEL || e.CLAUDE_MODEL || null, user: null, machine: null, started_in: null }
+      : e.CURSOR_AGENT ? 'cursor' : e.GEMINI_CLI ? 'gemini-cli' : e.COPILOT_AGENT || e.GITHUB_COPILOT_CLI ? 'copilot' : e.DEEDUM_AGENT || null
+    const out = { name, session: e.CLAUDE_CODE_SESSION_ID || e.CODEX_THREAD_ID || e.DEEDUM_SESSION || null,
+      model: e.DEEDUM_MODEL || e.ANTHROPIC_MODEL || e.CLAUDE_MODEL || null, user: null, machine: null, started_in: null }
     try { out.user = os.userInfo().username } catch {}
     try { out.machine = os.hostname() } catch {}
     const hook = sessionState().agent || {}
@@ -419,13 +419,13 @@
     } catch {}
     return null
   }
-  // ---- policy (twin of policy.py): the nearest .docket-policy.json over config.policy --------
+  // ---- policy (twin of policy.py): the nearest .deedum-policy.json over config.policy --------
   function loadPolicy() {
     let pol = { ...(cfg.policy || {}) }
     let d = CWD
     const home = os.homedir()
     for (;;) {
-      const f = path.join(d, '.docket-policy.json')
+      const f = path.join(d, '.deedum-policy.json')
       try {
         if (fs.statSync(f).isFile()) {
           const local = JSON.parse(fs.readFileSync(f, 'utf8'))
@@ -470,17 +470,17 @@
     const req = { id, host, method, path: p, project: PROJECT.name, why: why(), agent: AGENT, asked: Date.now() / 1000, state: 'pending' }
     fs.writeFileSync(f, JSON.stringify(req))
     const timeout = Number(rule.timeout || 600)
-    try { process.stderr.write(`[docket] ${method} ${host}${p} from ${PROJECT.name || '?'} (${why() || 'no reason'}) waits for approval: docket approve ${id}   (deny: docket deny ${id}; ${timeout}s)\n`) } catch {}
+    try { process.stderr.write(`[deedum] ${method} ${host}${p} from ${PROJECT.name || '?'} (${why() || 'no reason'}) waits for approval: deedum approve ${id}   (deny: deedum deny ${id}; ${timeout}s)\n`) } catch {}
     const deadline = Date.now() + timeout * 1000
     while (Date.now() < deadline) {
       let st = 'pending'
       try { st = JSON.parse(fs.readFileSync(f, 'utf8')).state } catch {}
       if (st === 'approved') return null
-      if (st === 'denied') return `docket: ${method} ${host}${p} denied by a person (approval ${id})`
+      if (st === 'denied') return `deedum: ${method} ${host}${p} denied by a person (approval ${id})`
       sleepSync(1000)
     }
     try { fs.writeFileSync(f, JSON.stringify({ ...req, state: 'expired' })) } catch {}
-    return `docket: ${method} ${host}${p} not approved within ${timeout}s (approval ${id})`
+    return `deedum: ${method} ${host}${p} not approved within ${timeout}s (approval ${id})`
   }
   function policyVerdict(host, method, p, kind) {
     const pol = loadPolicy()
@@ -494,7 +494,7 @@
       if (rk !== 'any' && rk !== kind) continue
       if (r.deny) {
         if (r.unless_why && reason) continue
-        return `docket policy: ${method} ${host} is refused${r.unless_why ? ' without a reason (docket why "...")' : ''}${r.note ? ` (${r.note})` : ''}`
+        return `deedum policy: ${method} ${host} is refused${r.unless_why ? ' without a reason (deedum why "...")' : ''}${r.note ? ` (${r.note})` : ''}`
       }
       if (r.approve) return requestApproval(r, host, method, p)
       if (r.allow) return null
@@ -506,18 +506,18 @@
         const per = b.per || 'session'
         const key = per === 'run' ? RUN : AGENT.session || 'default'
         const n = countWrites(b.host || '*', per, key)
-        if (n >= Number(b.writes || 0)) return `docket budget: ${n} writes to ${b.host || 'any host'} already this ${per} (limit ${b.writes})`
+        if (n >= Number(b.writes || 0)) return `deedum budget: ${n} writes to ${b.host || 'any host'} already this ${per} (limit ${b.writes})`
       }
     }
     return null
   }
   function gate(method, host, p, rawBody) {
     // A dry run blocks by METHOD (read_path_regex is a label, not a safety rule; see recorder.gate).
-    if (process.env.DOCKET_DRY === '1' && !['GET', 'HEAD', 'OPTIONS'].includes(method) && gqlKind(rawBody) !== 'read')
-      return 'docket dry run: write not sent'
+    if (process.env.DEEDUM_DRY === '1' && !['GET', 'HEAD', 'OPTIONS'].includes(method) && gqlKind(rawBody) !== 'read')
+      return 'deedum dry run: write not sent'
     if (kindOf(method, host, p, rawBody) !== 'write' || AUTH_RE.test(p)) return null
     if (!why() && (cfg.require_why_hosts || []).some((g) => glob(g, host)))
-      return `docket: writes to ${host} need a reason (docket run --why, or docket why "...")`
+      return `deedum: writes to ${host} need a reason (deedum run --why, or deedum why "...")`
     try { return policyVerdict(host, method, p, 'write') } catch (e) { warn(e); return null }
   }
 
@@ -571,7 +571,7 @@
 
   // ---- fetch (undici) -----------------------------------------------------------------------
   try {
-    if (typeof globalThis.fetch === 'function' && !globalThis.fetch.__docket) {
+    if (typeof globalThis.fetch === 'function' && !globalThis.fetch.__deedum) {
       const orig = globalThis.fetch
       const wrapped = async function fetch(input, init) {
         let method = 'GET'
@@ -625,7 +625,7 @@
         }
         return resp
       }
-      wrapped.__docket = true
+      wrapped.__deedum = true
       globalThis.fetch = wrapped
     }
   } catch (e) {
@@ -640,7 +640,7 @@
   for (const modName of ['http', 'https']) {
     try {
       const mod = require(`node:${modName}`)
-      if (mod.request.__docket) continue
+      if (mod.request.__deedum) continue
       const origRequest = mod.request
       const wrap = function request(...args) {
         let method = 'GET'
@@ -739,7 +739,7 @@
         }
         return req
       }
-      wrap.__docket = true
+      wrap.__deedum = true
       mod.request = wrap
       mod.get = function get(...args) {
         const r = mod.request(...args)

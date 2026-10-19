@@ -2,10 +2,10 @@
 the curl and exec shims (and mirrored in the Node hook).
 
 Where it comes from: `policy` in the trail's config.json first (a repository cannot loosen it),
-then the nearest `.docket-policy.json` walking up from the working directory (a repo's own
+then the nearest `.deedum-policy.json` walking up from the working directory (a repo's own
 rules, in git with the code). The first rule that matches decides; no match means allowed. Budgets count writes per session
 or per run and refuse the one that would go past. A write to an `approve` host waits for
-`docket approve ID` (or refuses after `timeout` seconds).
+`deedum approve ID` (or refuses after `timeout` seconds).
 
 {
   "rules": [
@@ -28,7 +28,7 @@ def find_policy_file(cwd=None):
     d = pathlib.Path(cwd or os.getcwd()).resolve()
     home = pathlib.Path.home().resolve()
     for p in [d, *d.parents]:
-        f = p / ".docket-policy.json"
+        f = p / ".deedum-policy.json"
         if f.is_file():
             return f
         if p == home:
@@ -38,7 +38,7 @@ def find_policy_file(cwd=None):
 
 def load(cfg, cwd=None):
     """The policy in force: the trail's config `policy` first (it cannot be loosened from a repository),
-    then the nearest .docket-policy.json."""
+    then the nearest .deedum-policy.json."""
     pol = dict((cfg or {}).get("policy") or {})
     f = find_policy_file(cwd)
     if f:
@@ -73,7 +73,7 @@ def decide(pol, trail, host, method, kind, project, why, run_id, session):
         if rule.get("deny"):
             if rule.get("unless_why") and why:
                 continue
-            return f"docket policy: {method} {host} is refused" + (" without a reason (docket why \"...\")" if rule.get("unless_why") else "") \
+            return f"deedum policy: {method} {host} is refused" + (" without a reason (deedum why \"...\")" if rule.get("unless_why") else "") \
                 + (f" ({rule.get('note')})" if rule.get("note") else "")
         if rule.get("approve"):
             return ("approve", rule)
@@ -89,7 +89,7 @@ def decide(pol, trail, host, method, kind, project, why, run_id, session):
             key = run_id if per == "run" else (session or "default")
             n = count_writes(trail, host_pat=b.get("host") or "*", per=per, key=key)
             if n >= int(b.get("writes", 0)):
-                return f"docket budget: {n} writes to {b.get('host') or 'any host'} already this {per} (limit {b.get('writes')})"
+                return f"deedum budget: {n} writes to {b.get('host') or 'any host'} already this {per} (limit {b.get('writes')})"
     return None
 
 
@@ -121,7 +121,7 @@ def count_writes(trail, host_pat, per, key):
 
 # ---- approvals: a write waits for a person -----------------------------------------------------
 def request_approval(trail, rule, host, method, path, project, why, agent, notify=None):
-    """Write the request, announce it, wait for `docket approve ID` / `docket deny ID`. Returns
+    """Write the request, announce it, wait for `deedum approve ID` / `deedum deny ID`. Returns
     None when approved, a refusal string otherwise."""
     d = pathlib.Path(trail) / ".state" / "approvals"
     d.mkdir(parents=True, exist_ok=True)
@@ -131,7 +131,7 @@ def request_approval(trail, rule, host, method, path, project, why, agent, notif
            "asked": time.time(), "state": "pending"}
     f.write_text(json.dumps(req))
     timeout = int(rule.get("timeout") or 600)
-    line = f"[docket] {method} {host}{path} from {project or '?'} ({why or 'no reason'}) waits for approval: docket approve {aid}   (deny: docket deny {aid}; {timeout}s)"
+    line = f"[deedum] {method} {host}{path} from {project or '?'} ({why or 'no reason'}) waits for approval: deedum approve {aid}   (deny: deedum deny {aid}; {timeout}s)"
     try:
         import sys
         sys.stderr.write(line + "\n")
@@ -148,13 +148,13 @@ def request_approval(trail, rule, host, method, path, project, why, agent, notif
         if state == "approved":
             return None
         if state == "denied":
-            return f"docket: {method} {host}{path} denied by a person (approval {aid})"
+            return f"deedum: {method} {host}{path} denied by a person (approval {aid})"
         time.sleep(1)
     try:
         f.write_text(json.dumps({**req, "state": "expired"}))
     except OSError:
         pass
-    return f"docket: {method} {host}{path} not approved within {timeout}s (approval {aid})"
+    return f"deedum: {method} {host}{path} not approved within {timeout}s (approval {aid})"
 
 
 import threading

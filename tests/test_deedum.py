@@ -1,11 +1,11 @@
-"""Run: python3 -m pytest tests  (or: python3 tests/test_docket.py)"""
+"""Run: python3 -m pytest tests  (or: python3 tests/test_deedum.py)"""
 import json, os, subprocess, sys, tempfile, threading, pathlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from docket import store
-from docket.recorder import Recorder
+from deedum import store
+from deedum.recorder import Recorder
 
 class Echo(BaseHTTPRequestHandler):
     def _r(self):
@@ -27,20 +27,20 @@ def trail():
     return d
 
 def clean_env(**kw):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("DOCKET_", "CLAUDE", "AWS_")) and k not in ("PYTHONPATH", "NODE_OPTIONS")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("DEEDUM_", "CLAUDE", "AWS_")) and k not in ("PYTHONPATH", "NODE_OPTIONS")}
     env.update(kw)
     return env
 
 
 def run(d, *cmd, why="t", extra=(), cwd=ROOT, **envkw):
-    env = clean_env(DOCKET_DIR=str(d), PYTHONPATH=str(ROOT), **envkw)
+    env = clean_env(DEEDUM_DIR=str(d), PYTHONPATH=str(ROOT), **envkw)
     w = ["--why", why] if why else []
-    return subprocess.run([sys.executable, "-m", "docket", "run", *w, *extra, "--", *cmd],
+    return subprocess.run([sys.executable, "-m", "deedum", "run", *w, *extra, "--", *cmd],
                           cwd=cwd, env=env, capture_output=True, text=True)
 
 
 def cli(d, *a):
-    return subprocess.run([sys.executable, "-m", "docket", "--dir", str(d), *a], cwd=ROOT,
+    return subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), *a], cwd=ROOT,
                           env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
 
 def records(d):
@@ -90,8 +90,8 @@ def test_requests_capture_if_installed():
 
 
 def test_value_scrub():
-    from docket.recorder import scrub_values
-    os.environ["DOCKET_TEST_API_TOKEN"] = "OddFormatValue0123456789"
+    from deedum.recorder import scrub_values
+    os.environ["DEEDUM_TEST_API_TOKEN"] = "OddFormatValue0123456789"
     line = json.dumps({"a": "cfk_" + "A" * 40, "b": "OddFormatValue0123456789", "c": "https://u:pw12345@h/x",
                        "d": "sk-proj-" + "x" * 30, "e": "Bearer abcdefgh12345", "keyword": "house"})
     out = scrub_values(line)
@@ -142,12 +142,12 @@ def test_guard_requires_a_reason():
 
 def test_session_why_and_claude_hook():
     base = serve(); d = trail()
-    env = clean_env(PYTHONPATH=str(ROOT), DOCKET_SESSION="s1")
-    hook = subprocess.run([sys.executable, "-m", "docket", "--dir", str(d), "why", "--from-claude-hook"],
+    env = clean_env(PYTHONPATH=str(ROOT), DEEDUM_SESSION="s1")
+    hook = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-hook"],
                           input=json.dumps({"session_id": "s1", "prompt": "raise   the bids\nplease"}),
                           env=env, capture_output=True, text=True, cwd=ROOT)
     assert hook.returncode == 0 and hook.stdout == "", hook
-    out = run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/b", "-d", "{}", why="", DOCKET_SESSION="s1")
+    out = run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/b", "-d", "{}", why="", DEEDUM_SESSION="s1")
     assert out.returncode == 0, out.stderr
     assert records(d)[0]["why"] == "asked: raise the bids please"
 
@@ -228,7 +228,7 @@ def test_dry_run_blocks_by_method_not_path():
 
 
 def test_field_name_redaction_is_by_word():
-    from docket.recorder import secret_name
+    from deedum.recorder import secret_name
     for yes in ("access_token", "X-Auth-Key", "xi-api-key", "accessToken", "appsecret_proof", "developertoken",
                 "password_confirm", "Cookie", "client_secret", "apikey", "Authorization", "refreshToken", "token_v2", "secret1", "api_key_2024", "session_id", "sessionId", "PHPSESSID", "authorization_code", "X-Authentication", "verification_code", "mfa_code", "tokenValue", "authTokenValue", "session_ticket", "SecretString", "password_hash", "access_tokens", "api_keys", "secrets", "credentials", "ssh_keys", "oauth_verifier", "code_challenge", "client_assertion"):
         assert secret_name(yes), yes
@@ -244,15 +244,15 @@ def test_field_name_redaction_is_by_word():
 
 
 def test_prose_reason_is_scrubbed():
-    from docket.recorder import scrub_prose
+    from deedum.recorder import scrub_prose
     assert scrub_prose("log in with password hunter2 and change the plan") == "log in with password <redacted> and change the plan"
     assert scrub_prose("the api key is abc123xyz, rotate it") == "the api key is <redacted>, rotate it"
     assert scrub_prose("raise the bids to $14") == "raise the bids to $14"
     base = serve(); d = trail()
-    env = clean_env(PYTHONPATH=str(ROOT), DOCKET_SESSION="s3")
-    subprocess.run([sys.executable, "-m", "docket", "--dir", str(d), "why", "--from-claude-hook"],
+    env = clean_env(PYTHONPATH=str(ROOT), DEEDUM_SESSION="s3")
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-hook"],
                    input=json.dumps({"session_id": "s3", "prompt": "use password hunter2 then save"}), env=env, capture_output=True, text=True, cwd=ROOT)
-    run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/p", "-d", "{}", why="", DOCKET_SESSION="s3")
+    run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/p", "-d", "{}", why="", DEEDUM_SESSION="s3")
     assert "hunter2" not in json.dumps(records(d)) and "hunter2" not in (d / "CHANGES.md").read_text()
 
 
@@ -295,11 +295,11 @@ def test_agent_block_and_via():
     base = serve(); d = trail()
     tp = pathlib.Path(tempfile.mkdtemp()) / "t.jsonl"
     tp.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-fable-5-1"}}) + "\n")
-    env = clean_env(PYTHONPATH=str(ROOT), DOCKET_SESSION="s5")
-    subprocess.run([sys.executable, "-m", "docket", "--dir", str(d), "why", "--from-claude-hook"],
+    env = clean_env(PYTHONPATH=str(ROOT), DEEDUM_SESSION="s5")
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-hook"],
                    input=json.dumps({"session_id": "s5", "prompt": "do it", "cwd": "/work/here", "transcript_path": str(tp)}),
                    env=env, capture_output=True, text=True, cwd=ROOT)
-    run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/a", "-d", "{}", why="", DOCKET_SESSION="s5", CLAUDECODE="1")
+    run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/a", "-d", "{}", why="", DEEDUM_SESSION="s5", CLAUDECODE="1")
     r = records(d)[0]
     assert r["via"] == "curl" and r["agent"]["name"] == "claude-code" and r["agent"]["model"] == "claude-fable-5-1"
     assert r["agent"]["started_in"] == "/work/here" and r["agent"]["session"] == "s5" and r["agent"]["user"]
@@ -307,7 +307,7 @@ def test_agent_block_and_via():
 
 def test_exec_shim_records_binaries():
     import shutil, stat
-    from docket.cli import ensure_exec_shims, BIN_DIR
+    from deedum.cli import ensure_exec_shims, BIN_DIR
     assert ensure_exec_shims(), BIN_DIR
     d = trail()
     fake = pathlib.Path(tempfile.mkdtemp())
@@ -320,7 +320,7 @@ def test_exec_shim_records_binaries():
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
     path = f"{fake}:{os.environ['PATH']}"
     # no writable place for the shims: a dry run refuses rather than running the real binary
-    out = run(d, "aws", "ssm", "send-command", extra=["--dry"], PATH=path, DOCKET_BIN="/dev/null/nowhere")
+    out = run(d, "aws", "ssm", "send-command", extra=["--dry"], PATH=path, DEEDUM_BIN="/dev/null/nowhere")
     assert out.returncode != 0 and "fake-" not in out.stdout and "refusing" in out.stderr, (out.stdout, out.stderr)
     out = run(d, "aws", "ssm", "send-command", "--profile", "prod", "--region", "us-east-1", "--instance-ids", "i-1", PATH=path)
     assert out.returncode == 0 and "fake-" in out.stdout, out.stderr
@@ -389,16 +389,16 @@ def test_exec_shim_records_binaries():
     # SIGTERM to the shim reaches the binary underneath
     import signal, time as _t
     slow = fake / "terraform"; slow.write_text("#!/bin/sh\ntrap 'echo child-terminated; exit 143' TERM\ntrap 'echo child-interrupted; exit 130' INT\nsleep 5 & wait $!\n"); slow.chmod(slow.stat().st_mode | stat.S_IEXEC)
-    env = clean_env(DOCKET_DIR=str(d), PYTHONPATH=str(ROOT), PATH=path)
-    pr = subprocess.Popen([sys.executable, "-m", "docket", "run", "--", "terraform", "apply"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True)
+    env = clean_env(DEEDUM_DIR=str(d), PYTHONPATH=str(ROOT), PATH=path)
+    pr = subprocess.Popen([sys.executable, "-m", "deedum", "run", "--", "terraform", "apply"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True)
     _t.sleep(1.5)
-    # the shim is docket run's child: find it and terminate it, as a supervisor would
+    # the shim is deedum run's child: find it and terminate it, as a supervisor would
     kids = subprocess.run(["pgrep", "-P", str(pr.pid)], capture_output=True, text=True).stdout.split()
     for k in kids: os.kill(int(k), signal.SIGTERM)
     outp, _ = pr.communicate(timeout=10)
     assert "child-terminated" in outp, outp
     assert [r["status"] for r in records(d) if r["method"] == "TERRAFORM"] == [143]
-    pr = subprocess.Popen([sys.executable, "-m", "docket", "run", "--", "terraform", "apply"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True)
+    pr = subprocess.Popen([sys.executable, "-m", "deedum", "run", "--", "terraform", "apply"], cwd=ROOT, env=env, stdout=subprocess.PIPE, text=True)
     _t.sleep(1.5)
     for k in subprocess.run(["pgrep", "-P", str(pr.pid)], capture_output=True, text=True).stdout.split(): os.kill(int(k), signal.SIGINT)
     outp, _ = pr.communicate(timeout=10)
@@ -448,7 +448,7 @@ def test_prune_and_pinned_hook():
     out = cli(d, "prune", "--before", "2020-01-15", "--rewrite-history"); assert out.returncode != 0 and "--writes-too" in out.stderr
     out = cli(d, "prune", "--before", "2020-01-15", "--writes-too"); assert out.returncode == 0, out.stderr
     assert [r["ts"][:10] for r in records(d)] == ["2020-02-01"] and "2020-01-01" not in (d / "CHANGES.md").read_text()
-    from docket.cli import hook_source, PKG_DIR, _change_line_patterns
+    from deedum.cli import hook_source, PKG_DIR, _change_line_patterns
     import re as _re
     pats = _change_line_patterns(d, "2026-03-05")   # a trail with no git history starts at the cutoff month
     blob = "# API changes\n\n- 2024-12-31 10:00 · old\n- 2026-01-09 10:00 · old\n- 2026-03-04 10:00 · old\n- 2026-03-05 10:00 · kept\n- 2026-03-06 10:00 · kept\n"
@@ -456,14 +456,14 @@ def test_prune_and_pinned_hook():
         blob = _re.sub(pat, "", blob)   # what git-filter-repo --replace-text does to every historical blob
     assert blob == "# API changes\n\n- 2026-03-05 10:00 · kept\n- 2026-03-06 10:00 · kept\n", blob
     env_out = cli(d, "env"); assert env_out.returncode == 0 and "ssh() {" in env_out.stdout and "curl() {" in env_out.stdout
-    from docket.cli import BIN_DIR, shim_wrapper
+    from deedum.cli import BIN_DIR, shim_wrapper
     w = (pathlib.Path(BIN_DIR) / "aws").read_text()
-    assert w.startswith("#!/bin/sh") and sys.executable in w and "DOCKET_SHIM_NAME=aws" in w, w   # no `env python3`: the machine may have none
+    assert w.startswith("#!/bin/sh") and sys.executable in w and "DEEDUM_SHIM_NAME=aws" in w, w   # no `env python3`: the machine may have none
     assert f"_EXPECTED = {PKG_DIR!r}" in hook_source()
-    # the planted hook refuses a DOCKET_PKG that is not the pinned checkout
-    env = clean_env(DOCKET_RUN="1", DOCKET_PKG="/nowhere/evil", DOCKET_DIR=str(d))
-    site = pathlib.Path(tempfile.mkdtemp()); (site / "docket_hook.py").write_text(hook_source())
-    out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import docket_hook; print('docket' in sys.modules)", str(site)], env=env, capture_output=True, text=True)
+    # the planted hook refuses a DEEDUM_PKG that is not the pinned checkout
+    env = clean_env(DEEDUM_RUN="1", DEEDUM_PKG="/nowhere/evil", DEEDUM_DIR=str(d))
+    site = pathlib.Path(tempfile.mkdtemp()); (site / "deedum_hook.py").write_text(hook_source())
+    out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import deedum_hook; print('deedum' in sys.modules)", str(site)], env=env, capture_output=True, text=True)
     assert out.stdout.strip() == "False", out.stdout + out.stderr
 
 
@@ -473,7 +473,7 @@ def test_prune_and_pinned_hook():
 def test_review_round2_dry_run_bypasses():
     base = serve(); d = trail(); port = base.rsplit(":", 1)[1]
     # GraphQL: operationName picks the operation; any mutation in the document is a write
-    from docket.recorder import graphql_kind
+    from deedum.recorder import graphql_kind
     assert graphql_kind("query A { x } mutation B { y }", "B") == "write"
     assert graphql_kind("query A { x } mutation B { y }", "A") == "read"
     assert graphql_kind("query A { x } mutation B { y }") == "write"
@@ -498,7 +498,7 @@ def test_review_round2_dry_run_bypasses():
     assert [r["path"] for r in records(d) if r["path"] == "/v1/b" and r["status"] == 200]
     # http.client built by hand
     py = f"import http.client as h; c=h.HTTPConnection('127.0.0.1',{port}); c.putrequest('DELETE','/v1/low'); c.putheader('X-Api-Key','k'*20); c.endheaders(b'{{}}'); print(c.getresponse().status)"
-    out = run(d, sys.executable, "-c", py, extra=["--dry"]); assert out.returncode != 0 and "blocked" in out.stderr.lower() + out.stdout.lower() or "DocketBlocked" in out.stderr, out.stderr[-300:]
+    out = run(d, sys.executable, "-c", py, extra=["--dry"]); assert out.returncode != 0 and "blocked" in out.stderr.lower() + out.stdout.lower() or "DeedumBlocked" in out.stderr, out.stderr[-300:]
     out = run(d, sys.executable, "-c", py); assert out.returncode == 0, out.stderr
     low = [r for r in records(d) if r["path"] == "/v1/low" and r["status"] == 200]
     assert len(low) == 1 and low[0]["request"]["headers"]["X-Api-Key"] == "<redacted>", low
@@ -525,14 +525,14 @@ def test_review_round2_credentials_and_compat():
     assert "dev-tok" not in out and "pw-123456" not in out and "<Name>bob</Name>" in out, out
     out = r.body(xml[:60], 10000)["_text"]; assert "dev-tok" not in out, out   # cut inside the element
     # prose: quoted passphrases whole; a truncation on a backslash
-    from docket.recorder import scrub_prose, scrub_argv_list
+    from deedum.recorder import scrub_prose, scrub_argv_list
     assert scrub_prose('the passphrase is "correct horse battery staple" ok') == 'the passphrase is <redacted> ok'
     assert "orchard" not in r.redact_json_text('{"passphrase":"a quiet orchard beside the river\\')
     # -p where it is a password
     assert "hunter2" not in scrub_argv_list(["mysql", "-u", "root", "-phunter2hunter2", "db"])
     assert "hunter2" not in scrub_argv_list(["az", "login", "-u", "me", "-p", "hunter2hunter2"])
     assert scrub_argv_list(["ssh", "-p", "2222", "h"]) == "ssh -p 2222 h"
-    # --why prose through docket run, in runs/, CHANGES.md and the commit subject
+    # --why prose through deedum run, in runs/, CHANGES.md and the commit subject
     out = run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/w", "-d", "{}", why="log in with password Hunter2Hunter2 then save", extra=["--commit"])
     blob = json.dumps(records(d)) + json.dumps(list(store.iter_records(d, "runs"))) + (d / "CHANGES.md").read_text()
     assert "Hunter2" not in blob
@@ -550,7 +550,7 @@ def test_review_round2_credentials_and_compat():
     assert out.returncode == 0 and out.stdout.startswith("200 "), out.stderr[-300:]
     out = run(d, sys.executable, "-c", "import urllib.request as u; r=u.urlopen('file:///etc/hosts'); print(len(r.read(5)), r.readline()[:1] is not None); print([l for l in u.urlopen('data:text/plain,hi')][0])")
     assert out.returncode == 0 and "5 True" in out.stdout and "b'hi'" in out.stdout, out.stderr[-300:]
-    from docket.recorder import scrub_values
+    from deedum.recorder import scrub_values
     assert "AAHxyz" not in scrub_values("https://api.telegram.org/bot7123456789:AAHxyz_abcdefghijklmnopqrstuvwxyz0123456/sendMessage")
     # curl into a closed pipe: quiet, exit 23
     sh = f"curl -s {base}/v1/pipe | head -c 2; echo \" exit=${{PIPESTATUS[0]:-$pipestatus[1]}}\""
@@ -562,7 +562,7 @@ def test_policy_budgets_approvals():
     base = serve(); d = trail()
     proj = pathlib.Path(tempfile.mkdtemp()) / "shop"; proj.mkdir()
     subprocess.run(["git", "init", "-q", str(proj)], check=True)
-    (proj / ".docket-policy.json").write_text(json.dumps({
+    (proj / ".deedum-policy.json").write_text(json.dumps({
         "rules": [{"host": "127.0.0.1", "methods": ["DELETE"], "deny": True, "note": "no deletes from here"},
                   {"host": "127.0.0.1", "deny": True, "unless_why": True}],
         "budgets": [{"host": "127.0.0.1", "writes": 2, "per": "run"}]}))
@@ -581,11 +581,11 @@ def test_policy_budgets_approvals():
     assert cli(d, "policy").returncode == 0
     # a repository file cannot loosen the trail's own rules
     cfgp = d / "config.json"; cfg = json.loads(cfgp.read_text()); cfg["policy"] = {"rules": [{"host": "127.0.0.1", "methods": ["PATCH"], "deny": True}]}; cfgp.write_text(json.dumps(cfg))
-    (proj / ".docket-policy.json").write_text(json.dumps({"rules": [{"host": "*", "allow": True}]}))
+    (proj / ".deedum-policy.json").write_text(json.dumps({"rules": [{"host": "*", "allow": True}]}))
     out = run(d, "curl", "-s", "-X", "PATCH", f"{base}/v1/x", "-d", "{}", cwd=proj, why="because"); assert out.returncode == 7, out.stderr
     cfg.pop("policy"); cfgp.write_text(json.dumps(cfg))
-    # approval: a write waits; `docket approve` from elsewhere lets it go; `deny` refuses it
-    (proj / ".docket-policy.json").write_text(json.dumps({"rules": [{"host": "127.0.0.1", "approve": True, "timeout": 20}]}))
+    # approval: a write waits; `deedum approve` from elsewhere lets it go; `deny` refuses it
+    (proj / ".deedum-policy.json").write_text(json.dumps({"rules": [{"host": "127.0.0.1", "approve": True, "timeout": 20}]}))
     import threading, time as _t
     def settle(state):
         for _ in range(100):
@@ -601,7 +601,7 @@ def test_policy_budgets_approvals():
     assert out.returncode == 7 and "denied by a person" in out.stderr, out.stderr
     assert [r["status"] for r in records(d) if r["path"] in ("/v1/ok", "/v1/no")] == [200, "BLOCKED"]
     rows = json.loads(cli(d, "approvals", "--all", "--json").stdout); assert sorted(r["state"] for r in rows) == ["approved", "denied"]
-    from docket import policy as _pol
+    from deedum import policy as _pol
     import threading as _th
     seen = {}
     def other():
@@ -611,22 +611,40 @@ def test_policy_budgets_approvals():
     assert seen["flag"] is False
 
 
+def test_guide_and_claude_hook_write():
+    d = trail(); proj = pathlib.Path(tempfile.mkdtemp())
+    out = cli(d, "guide"); assert out.returncode == 0 and "deedum why" in out.stdout
+    out = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "guide", "--write"], cwd=proj, env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
+    assert out.returncode == 0 and (proj / "AGENTS.md").read_text().count("<!-- deedum guide -->") == 1
+    (proj / "AGENTS.md").write_text("# mine\n\n" + (proj / "AGENTS.md").read_text())
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "guide", "--write"], cwd=proj, env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
+    t = (proj / "AGENTS.md").read_text(); assert t.startswith("# mine") and t.count("<!-- deedum guide -->") == 1
+    settings = proj / "settings.json"; settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}, "theme": "dark"}))
+    pre = proj / "pre.json"; pre.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "DEEDUM_DIR=x /opt/x/deedum commit -m hi || true"}]}]}}))
+    out = cli(d, "hook", "claude", "--write", "--settings", str(pre)); assert "added UserPromptSubmit hooks" in out.stdout, out.stdout   # an older hand-written commit hook counts
+    out = cli(d, "hook", "claude", "--write", "--settings", str(settings)); assert out.returncode == 0 and "added" in out.stdout, out.stderr
+    data = json.loads(settings.read_text())
+    assert data["theme"] == "dark" and len(data["hooks"]["Stop"]) == 2 and any("why --from-claude-hook" in h["command"] for g in data["hooks"]["UserPromptSubmit"] for h in g["hooks"])
+    out = cli(d, "hook", "claude", "--write", "--settings", str(settings)); assert "already" in out.stdout
+    assert len(json.loads(settings.read_text())["hooks"]["Stop"]) == 2
+
+
 def test_mcp_and_html():
     base = serve(); d = trail()
     run(d, "curl", "-s", "-X", "PUT", f"{base}/v1/m", "-d", '{"a":1}', why="mcp test")
-    from docket import mcp
+    from deedum import mcp
     import io
     msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "docket_log", "arguments": {"writes": True}}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "docket_report", "arguments": {}}}, {"jsonrpc": "2.0", "id": 5, "method": "nope"}]
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "deedum_log", "arguments": {"writes": True}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "deedum_report", "arguments": {}}}, {"jsonrpc": "2.0", "id": 5, "method": "nope"}]
     out = io.StringIO()
     mcp.serve(d, inp=io.StringIO("\n".join(json.dumps(m) for m in msgs) + "\n[]\n\"x\"\n" + json.dumps({"jsonrpc": "2.0", "id": 6, "method": "ping"}) + "\n"), out=out)
     replies = [json.loads(l) for l in out.getvalue().splitlines()]
     assert [r["id"] for r in replies] == [1, 2, 3, 4, 5, None, None, 6], [r.get("id") for r in replies]
-    assert replies[0]["result"]["serverInfo"]["name"] == "docket" and len(replies[1]["result"]["tools"]) == 7
+    assert replies[0]["result"]["serverInfo"]["name"] == "deedum" and len(replies[1]["result"]["tools"]) == 7
     assert "/v1/m" in replies[2]["result"]["content"][0]["text"] and not replies[2]["result"]["isError"]
     assert "mcp test" in replies[3]["result"]["content"][0]["text"] and "error" in replies[4]
-    p = subprocess.run([sys.executable, "-m", "docket", "--dir", str(d), "mcp"], input=json.dumps(msgs[2]) + "\n", cwd=ROOT, env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
+    p = subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "mcp"], input=json.dumps(msgs[2]) + "\n", cwd=ROOT, env=clean_env(PYTHONPATH=str(ROOT)), capture_output=True, text=True)
     assert p.returncode == 0 and '"tools"' in p.stdout, p.stderr
     out_html = pathlib.Path(tempfile.mkdtemp()) / "t.html"
     p = cli(d, "html", "--out", str(out_html)); assert p.returncode == 0, p.stderr

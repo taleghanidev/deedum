@@ -1,19 +1,19 @@
-# Injected by `docket run` via PYTHONPATH. Installs the hooks in every Python process it starts.
+# Injected by `deedum run` via PYTHONPATH. Installs the hooks in every Python process it starts.
 import os, sys
-_pkg = os.environ.get("DOCKET_PKG")
+_pkg = os.environ.get("DEEDUM_PKG")
 if _pkg and _pkg not in sys.path:
     sys.path.insert(0, _pkg)
 try:
-    import docket
-    docket.install()
+    import deedum
+    deedum.install()
     # plant the env-gated .pth hook in this interpreter so scripts that overwrite PYTHONPATH still record
     try:
-        from docket.cli import plant_hook
+        from deedum.cli import plant_hook
         plant_hook()
     except Exception:
         pass
 except Exception as _e:
-    sys.stderr.write(f"[docket] not installed in this process: {_e}\n")
+    sys.stderr.write(f"[deedum] not installed in this process: {_e}\n")
 # chain any sitecustomize that this one shadowed
 _me = os.path.dirname(os.path.abspath(__file__))
 _orig = [p for p in sys.path if p and os.path.abspath(p) != _me]

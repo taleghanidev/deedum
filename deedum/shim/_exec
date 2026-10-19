@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Shim for binaries no in-process hook can see (ssh, aws, gh, terraform, kubectl, git push ...).
-Symlinked under each name in this folder by `docket setup` / `docket run`. Records the command
+Symlinked under each name in this folder by `deedum setup` / `deedum run`. Records the command
 as one call (transport "exec": the tool, its subcommand, the target host or profile, the exit
 code; argv scrubbed) and runs the real binary with the same stdin, stdout, stderr and tty, so
 interactive ssh and prompts work unchanged. A failure in here never stops the command."""
 import os, sys, subprocess, time, re
-_pkg = os.environ.get("DOCKET_PKG")
+_pkg = os.environ.get("DEEDUM_PKG")
 if _pkg and _pkg not in sys.path:
     sys.path.insert(0, _pkg)
 
-NAME = os.environ.get("DOCKET_SHIM_NAME") or os.path.basename(sys.argv[0])
+NAME = os.environ.get("DEEDUM_SHIM_NAME") or os.path.basename(sys.argv[0])
 HERE = os.path.dirname(os.path.realpath(__file__))
-SHIM_BIN = os.environ.get("DOCKET_SHIM_DIR")   # the wrappers' folder: never the "real" binary
+SHIM_BIN = os.environ.get("DEEDUM_SHIM_DIR")   # the wrappers' folder: never the "real" binary
 
 # What is provably a READ. Everything else is a write: for a change log, and for `--dry`, a
 # wrong "read" is the dangerous mistake, so these are tight. `aws logs delete-log-group` is not
@@ -188,7 +188,7 @@ def _git_expand(args, words):
 
 
 def real_binary():
-    meant = os.environ.get("DOCKET_REAL_BIN")   # `docket run -- /usr/local/bin/aws ...`: that one, not PATH's
+    meant = os.environ.get("DEEDUM_REAL_BIN")   # `deedum run -- /usr/local/bin/aws ...`: that one, not PATH's
     if meant and os.path.basename(meant) == NAME and os.path.isfile(meant) and os.access(meant, os.X_OK) \
             and os.path.realpath(meant) != os.path.realpath(__file__):
         return meant
@@ -204,7 +204,7 @@ def real_binary():
 def _is_wrapper(c):
     try:
         with open(c, "rb") as f:
-            return b"# docket shim:" in f.read(200)
+            return b"# deedum shim:" in f.read(200)
     except OSError:
         return False
 
@@ -260,7 +260,7 @@ def _scrub_command_text(text):
         return text
     try:
         import shlex
-        from docket.recorder import scrub_argv_list
+        from deedum.recorder import scrub_argv_list
         return scrub_argv_list(shlex.split(text), quote=False)[:200]
     except Exception:
         return "<command text omitted: could not parse it for redaction>"
@@ -331,7 +331,7 @@ def describe(argv):
         elif known:
             kind = None                                          # local: not recorded at all
         else:
-            kind = "write" if os.environ.get("DOCKET_DRY") == "1" else None   # unknown: refused under --dry
+            kind = "write" if os.environ.get("DEEDUM_DRY") == "1" else None   # unknown: refused under --dry
     elif NAME in ("ssh", "sftp"):
         kind = "read" if ssh_safe and ssh_is_read(remote_cmd) else "write"   # no command = an interactive shell
     elif NAME in ("scp", "rsync"):
@@ -371,10 +371,10 @@ def main():
         sys.stderr.write(f"{NAME}: command not found\n"); sys.exit(127)
     rec = None; host = sub = None; kind = None; why_not = None
     try:
-        from docket.recorder import Recorder, scrub_argv_list
-        from docket import store
+        from deedum.recorder import Recorder, scrub_argv_list
+        from deedum import store
         d = store.find_dir()
-        if d and os.environ.get("DOCKET_RUN"):
+        if d and os.environ.get("DEEDUM_RUN"):
             rec = Recorder(d)
             host, sub, kind = describe(argv)
             sub = rec.scrub_argv(_scrub_command_text(sub))   # `deploy --password "a b c"` goes into path and CHANGES.md
@@ -383,17 +383,17 @@ def main():
                 rec.cfg.setdefault("rules", []).insert(0, {"host": host, "path_regex": r".*", "kind": kind})
                 why_not = rec.gate("EXEC" if kind == "write" else "GET", host, "/" + sub, None, transport="exec")
     except Exception as e:
-        sys.stderr.write(f"[docket] {NAME} shim: {e}\n")
-        if os.environ.get("DOCKET_DRY") == "1":   # a dry run fails closed: unclassified means not run
-            why_not = f"docket dry run: could not classify the command ({e})"
+        sys.stderr.write(f"[deedum] {NAME} shim: {e}\n")
+        if os.environ.get("DEEDUM_DRY") == "1":   # a dry run fails closed: unclassified means not run
+            why_not = f"deedum dry run: could not classify the command ({e})"
     if why_not:
         # Refused. Recording the refusal may fail (full disk, unwritable trail); the command
         # still does not run.
         try:
             rec.blocked("exec", NAME.upper(), host, "/" + sub, None, {}, rec.scrub_argv(scrub_argv_list(argv))[:2000], why_not, via="exec")
         except Exception as e:
-            sys.stderr.write(f"[docket] could not record the refusal: {e}\n")
-        sys.stderr.write(f"[docket] {why_not}: {NAME} {sub}\n")
+            sys.stderr.write(f"[deedum] could not record the refusal: {e}\n")
+        sys.stderr.write(f"[deedum] {why_not}: {NAME} {sub}\n")
         sys.exit(7)
     t0 = time.time()
     code = run_forwarding_signals([real] + argv).wait()
@@ -406,7 +406,7 @@ def main():
                         "resp_body": None, "ms": int((time.time() - t0) * 1000),
                         "error": None if code == 0 else f"{NAME} exit {code}"})
         except Exception as e:
-            sys.stderr.write(f"[docket] {NAME} record failed: {e}\n")
+            sys.stderr.write(f"[deedum] {NAME} record failed: {e}\n")
     sys.exit(code)
 
 

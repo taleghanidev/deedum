@@ -3,4 +3,4 @@
 useDefault = true
 
 [allowlist]
-paths = ['''tests/test_docket\.py''', '''__pycache__''']
+paths = ['''tests/test_deedum\.py''', '''__pycache__''']

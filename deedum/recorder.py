@@ -223,17 +223,17 @@ def graphql_kind(q, operation_name=None):
     return "read" if q.lstrip().startswith("{") else None
 
 
-class DocketBlocked(PermissionError):
-    """Raised instead of sending a write that `docket run --dry` or require_why_hosts refused."""
+class DeedumBlocked(PermissionError):
+    """Raised instead of sending a write that `deedum run --dry` or require_why_hosts refused."""
 
 
 class Recorder:
     def __init__(self, trail_dir, why=None, run_id=None):
         self.dir = pathlib.Path(trail_dir)
         self.cfg = store.load_config(self.dir)
-        self._why_arg = scrub_prose(why or os.environ.get("DOCKET_WHY") or "")
-        self.dry = os.environ.get("DOCKET_DRY") == "1"
-        env_run = os.environ.get("DOCKET_RUN")
+        self._why_arg = scrub_prose(why or os.environ.get("DEEDUM_WHY") or "")
+        self.dry = os.environ.get("DEEDUM_DRY") == "1"
+        env_run = os.environ.get("DEEDUM_RUN")
         if env_run == "always":  # always-on mode: group by the Claude Code session when there is one
             env_run = ("session-" + os.environ["CLAUDE_CODE_SESSION_ID"][:8]) if os.environ.get("CLAUDE_CODE_SESSION_ID") else None
         self.run = run_id or env_run or uuid.uuid4().hex[:8]
@@ -251,7 +251,7 @@ class Recorder:
 
     @property
     def why(self):
-        """--why / DOCKET_WHY, else the session's reason set with `docket why "..."` (re-read on
+        """--why / DEEDUM_WHY, else the session's reason set with `deedum why "..."` (re-read on
         every call, so a reason set mid-session applies to the very next call)."""
         return self._why_arg or store.get_session_why(self.dir) or ""
 
@@ -266,11 +266,11 @@ class Recorder:
         # and POST /webhooks/status all went out under --dry until 0.3), and the gate must not
         # depend on it. A GraphQL query is the one POST that is provably a read.
         if self.dry and method.upper() not in ("GET", "HEAD", "OPTIONS") and gql != "read" and not (transport == "grpc" and kind == "read"):
-            return "docket dry run: write not sent"
+            return "deedum dry run: write not sent"
         if kind != "write" or (transport == "http" and self._auth_re.search(path or "")):
             return None
         if not self.why and any(fnmatch.fnmatch((host or "").lower(), p) for p in self.cfg.get("require_why_hosts", [])):
-            return f"docket: writes to {host} need a reason (docket run --why, or docket why \"...\")"
+            return f"deedum: writes to {host} need a reason (deedum run --why, or deedum why \"...\")"
         return self._policy(host, method, path, kind)
 
     def _policy(self, host, method, path, kind):
@@ -292,7 +292,7 @@ class Recorder:
         self.record({"transport": transport, "via": via, "method": method, "host": host, "path": path, "query": query,
                      "req_headers": headers, "req_body": body, "status": "BLOCKED", "resp_body": None,
                      "ms": 0, "error": reason})
-        return DocketBlocked(reason)
+        return DeedumBlocked(reason)
 
     # ---- classification / redaction -------------------------------------------------------
     def ignored(self, host):
@@ -476,7 +476,7 @@ class Recorder:
                 f()
             except Exception:
                 pass
-        if self.reads + self.writes == 0 and os.environ.get("DOCKET_RUN") in (None, "always"):
+        if self.reads + self.writes == 0 and os.environ.get("DEEDUM_RUN") in (None, "always"):
             return None  # a process that made no calls leaves no run line (always-on mode would flood runs/)
         rec = {"run": self.run, "argv": self.argv, "cwd": self.cwd, "why": self.why,
                "project": self.project["name"], "folder": self.project["folder"], "branch": self.project["branch"],
@@ -500,7 +500,7 @@ def _hook_requests(rec):
     except ImportError:
         return False
     orig = requests.Session.send
-    if getattr(orig, "_docket", False):
+    if getattr(orig, "_deedum", False):
         return True
     def send(self, request, **kw):
         host, path, q = _split(request.url)
@@ -525,8 +525,8 @@ def _hook_requests(rec):
                             "resp_body": (resp.content if resp is not None and not kw.get("stream") else None),
                             "ms": int((time.time() - t0) * 1000), "error": err})
             except Exception as e:  # never break the caller
-                sys.stderr.write(f"[docket] record failed: {e}\n")
-    send._docket = True
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
+    send._deedum = True
     requests.Session.send = send
     return True
 
@@ -550,7 +550,7 @@ def _hook_httpx(rec):
     import httpx
     def wrap(cls, is_async):
         orig = cls.send
-        if getattr(orig, "_docket", False):
+        if getattr(orig, "_deedum", False):
             return
         def after(request, resp, err, t0):
             try:
@@ -566,7 +566,7 @@ def _hook_httpx(rec):
                             "req_body": _httpx_content(request), "status": resp.status_code if resp is not None else None,
                             "resp_body": body, "ms": int((time.time() - t0) * 1000), "error": err})
             except Exception as e:
-                sys.stderr.write(f"[docket] record failed: {e}\n")
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
         def check(request):
             host, path, q = _split(str(request.url))
             why_not = rec.gate(request.method.upper(), host, path, _httpx_content(request))
@@ -598,7 +598,7 @@ def _hook_httpx(rec):
                     err = f"{type(e).__name__}: {e}"[:500]; raise
                 finally:
                     after(request, resp, err, t0)
-        send._docket = True
+        send._deedum = True
         cls.send = send
     wrap(httpx.Client, False)
     wrap(httpx.AsyncClient, True)
@@ -610,7 +610,7 @@ _pending = set()   # flush callbacks of responses not yet recorded (urllib, http
 def _hook_urllib(rec):
     import urllib.request as ur
     orig = ur.OpenerDirector.open
-    if getattr(orig, "_docket", False):
+    if getattr(orig, "_deedum", False):
         return True
     def open_(self, fullurl, data=None, timeout=None):
         req = fullurl if isinstance(fullurl, ur.Request) else ur.Request(fullurl, data=data)
@@ -629,7 +629,7 @@ def _hook_urllib(rec):
                 rec.record(dict(base, status=getattr(e, "code", None), resp_body=None, ms=int((time.time() - t0) * 1000),
                                 error=f"{type(e).__name__}: {e}"[:500]))
             except Exception as e2:
-                sys.stderr.write(f"[docket] record failed: {e2}\n")
+                sys.stderr.write(f"[deedum] record failed: {e2}\n")
             raise
         finally:
             _tl.ul -= 1
@@ -639,7 +639,7 @@ def _hook_urllib(rec):
         # read by them at their pace; the hook copies what passes, up to the budget, and writes
         # the record when the body ends or the response is closed.
         return _Tap(resp, rec, base, t0)
-    open_._docket = True
+    open_._deedum = True
     ur.OpenerDirector.open = open_
     return True
 
@@ -668,7 +668,7 @@ class _Tap:
             self._rec.record(dict(self._base, status=getattr(self._resp, "status", None), resp_body=b"".join(self._chunks),
                                   ms=int((time.time() - self._t0) * 1000), error=None))
         except Exception as e:
-            sys.stderr.write(f"[docket] record failed: {e}\n")
+            sys.stderr.write(f"[deedum] record failed: {e}\n")
 
     def read(self, amt=None):
         data = self._resp.read(amt)
@@ -739,7 +739,7 @@ def _hook_http_client(rec):
     (google-api-python-client, which the Google Sheets / Search Console / YouTube clients use).
     Calls that an outer hook already records are skipped through the thread-local counters."""
     import http.client as hc
-    if getattr(hc.HTTPConnection.request, "_docket", False):
+    if getattr(hc.HTTPConnection.request, "_deedum", False):
         return True
     orig_request, orig_getresponse = hc.HTTPConnection.request, hc.HTTPConnection.getresponse
 
@@ -755,30 +755,30 @@ def _hook_http_client(rec):
         if why_not:
             raise rec.blocked("http", method.upper(), self.host, path, query, dict(headers or {}),
                               body if isinstance(body, (bytes, str)) else None, why_not)
-        self._docket_req = {"method": method.upper(), "host": self.host, "path": path or "/", "query": query,
+        self._deedum_req = {"method": method.upper(), "host": self.host, "path": path or "/", "query": query,
                             "req_headers": dict(headers or {}),
                             "req_body": body if isinstance(body, (bytes, str)) else None, "t0": time.time()}
         try:
             return orig_request(self, method, url, body, headers or {}, *a, **kw)
         except Exception as e:   # refused connection, TLS failure: the attempt is still on the record
-            pending, self._docket_req = self._docket_req, None
+            pending, self._deedum_req = self._deedum_req, None
             t0 = pending.pop("t0")
             try:
                 rec.record(dict(pending, transport="http", status=None, resp_body=None,
                             ms=int((time.time() - t0) * 1000), error=f"{type(e).__name__}: {e}"[:500]))
             except Exception as e2:   # a full disk must not replace the network error the caller handles
-                sys.stderr.write(f"[docket] record failed: {e2}\n")
+                sys.stderr.write(f"[deedum] record failed: {e2}\n")
             raise
 
     orig_putrequest, orig_putheader, orig_endheaders = hc.HTTPConnection.putrequest, hc.HTTPConnection.putheader, hc.HTTPConnection.endheaders
 
     def putrequest(self, method, url, *a, **kw):
-        if not _outer() and getattr(self, "_docket_req", None) is None:
-            self._docket_low = {"method": method, "url": url, "headers": {}}
+        if not _outer() and getattr(self, "_deedum_req", None) is None:
+            self._deedum_low = {"method": method, "url": url, "headers": {}}
         return orig_putrequest(self, method, url, *a, **kw)
 
     def putheader(self, header, *values):
-        low = getattr(self, "_docket_low", None)
+        low = getattr(self, "_deedum_low", None)
         if low is not None:
             try:
                 low["headers"][str(header)] = ", ".join(v.decode("latin-1") if isinstance(v, bytes) else str(v) for v in values)
@@ -787,9 +787,9 @@ def _hook_http_client(rec):
         return orig_putheader(self, header, *values)
 
     def endheaders(self, message_body=None, **kw):
-        low = getattr(self, "_docket_low", None)
-        self._docket_low = None
-        if low is not None and not _outer() and getattr(self, "_docket_req", None) is None:
+        low = getattr(self, "_deedum_low", None)
+        self._deedum_low = None
+        if low is not None and not _outer() and getattr(self, "_deedum_req", None) is None:
             # built by hand (putrequest / putheader / endheaders): gate and record it like request()
             path, _, qs = (low["url"] or "/").partition("?")
             query = dict(parse_qsl(qs)) if qs else None
@@ -797,13 +797,13 @@ def _hook_http_client(rec):
             why_not = rec.gate(low["method"].upper(), self.host, path, body)
             if why_not:
                 raise rec.blocked("http", low["method"].upper(), self.host, path, query, low["headers"], body, why_not)
-            self._docket_req = {"method": low["method"].upper(), "host": self.host, "path": path or "/", "query": query,
+            self._deedum_req = {"method": low["method"].upper(), "host": self.host, "path": path or "/", "query": query,
                                 "req_headers": low["headers"], "req_body": body, "t0": time.time()}
         return orig_endheaders(self, message_body, **kw)
 
     def getresponse(self):
-        pending = getattr(self, "_docket_req", None)
-        self._docket_req = None
+        pending = getattr(self, "_deedum_req", None)
+        self._deedum_req = None
         if _outer() or pending is None:
             return orig_getresponse(self)
         t0 = pending.pop("t0")
@@ -814,7 +814,7 @@ def _hook_http_client(rec):
                 rec.record(dict(pending, transport="http", status=None, resp_body=None,
                             ms=int((time.time() - t0) * 1000), error=f"{type(e).__name__}: {e}"[:500]))
             except Exception as e2:   # a full disk must not replace the network error the caller handles
-                sys.stderr.write(f"[docket] record failed: {e2}\n")
+                sys.stderr.write(f"[deedum] record failed: {e2}\n")
             raise
         # The body is the caller's to read, possibly in chunks: copy what passes through read()
         # and write the record when it is finished or closed (once).
@@ -831,7 +831,7 @@ def _hook_http_client(rec):
                 rec.record(dict(pending, transport="http", status=resp.status, resp_body=b"".join(chunks),
                                 ms=int((time.time() - t0) * 1000), error=None))
             except Exception as e:
-                sys.stderr.write(f"[docket] record failed: {e}\n")
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
 
         busy = [False]   # read(n) calls readinto() underneath: count the bytes once
         orig_readinto, orig_read1 = resp.readinto, getattr(resp, "read1", None)
@@ -881,7 +881,7 @@ def _hook_http_client(rec):
         _pending.add(flush)   # a response never read nor closed is still recorded at exit
         return resp
 
-    request._docket = True
+    request._deedum = True
     hc.HTTPConnection.request, hc.HTTPConnection.getresponse = request, getresponse
     hc.HTTPConnection.putrequest, hc.HTTPConnection.putheader, hc.HTTPConnection.endheaders = putrequest, putheader, endheaders
     return True
@@ -896,7 +896,7 @@ def _hook_aiohttp(rec):
     except Exception:
         return False
     orig = aiohttp.ClientSession._request
-    if getattr(orig, "_docket", False):
+    if getattr(orig, "_deedum", False):
         return True
 
     async def _request(self, method, str_or_url, **kw):
@@ -938,7 +938,7 @@ def _hook_aiohttp(rec):
             try:
                 rec.record(dict(base_rec, status=None, resp_body=None, ms=int((time.time() - t0) * 1000), error=f"{type(e).__name__}: {e}"[:500]))
             except Exception as e2:   # a full disk must not replace the network error the caller handles
-                sys.stderr.write(f"[docket] record failed: {e2}\n")
+                sys.stderr.write(f"[deedum] record failed: {e2}\n")
             raise
         # The body is the caller's: a streaming consumer (iter_chunked, content.read) must see
         # every byte, so nothing is read here. The record is written when the caller's own
@@ -954,7 +954,7 @@ def _hook_aiohttp(rec):
                 rec.record(dict(base_rec, status=resp.status, resp_body=data, ms=int((time.time() - t0) * 1000), error=None,
                                 req_headers={**headers, **dict(resp.request_info.headers)}))
             except Exception as e:
-                sys.stderr.write(f"[docket] record failed: {e}\n")
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
         _pending.add(flush)
         orig_read, orig_release, orig_close = resp.read, resp.release, resp.close
 
@@ -972,7 +972,7 @@ def _hook_aiohttp(rec):
             return orig_close()
         resp.read, resp.release, resp.close = read, release, close
         return resp
-    _request._docket = True
+    _request._deedum = True
     aiohttp.ClientSession._request = _request
     return True
 
@@ -988,7 +988,7 @@ def _hook_urllib3(rec):
     except Exception:
         return False
     orig = cp.HTTPConnectionPool.urlopen
-    if getattr(orig, "_docket", False):
+    if getattr(orig, "_deedum", False):
         return True
     def urlopen(self, method, url, body=None, headers=None, *a, **kw):
         if getattr(_tl, "inner", 0) > 0 or getattr(_tl, "u3", 0) > 0:
@@ -1019,8 +1019,8 @@ def _hook_urllib3(rec):
                             "status": getattr(resp, "status", None), "resp_body": data,
                             "ms": int((time.time() - t0) * 1000), "error": err})
             except Exception as e:
-                sys.stderr.write(f"[docket] record failed: {e}\n")
-    urlopen._docket = True
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
+    urlopen._deedum = True
     cp.HTTPConnectionPool.urlopen = urlopen
     return True
 
@@ -1046,7 +1046,7 @@ def _hook_grpc(rec):
         import grpc
     except Exception:
         return False
-    if getattr(grpc, "_docket", False):
+    if getattr(grpc, "_deedum", False):
         return True
 
     class Trail(grpc.UnaryUnaryClientInterceptor, grpc.UnaryStreamClientInterceptor):
@@ -1089,7 +1089,7 @@ def _hook_grpc(rec):
                             "resp_body": json.dumps(resp_obj, default=str) if resp_obj is not None else None,
                             "ms": int((time.time() - t0) * 1000), "error": err})
             except Exception as e:
-                sys.stderr.write(f"[docket] record failed: {e}\n")
+                sys.stderr.write(f"[deedum] record failed: {e}\n")
 
     orig_secure, orig_insecure = grpc.secure_channel, grpc.insecure_channel
     def secure_channel(target, *a, **kw):
@@ -1097,7 +1097,7 @@ def _hook_grpc(rec):
     def insecure_channel(target, *a, **kw):
         return grpc.intercept_channel(orig_insecure(target, *a, **kw), Trail(target))
     grpc.secure_channel, grpc.insecure_channel = secure_channel, insecure_channel
-    grpc._docket = True
+    grpc._deedum = True
     # gRPC method names: treat Mutate/Create/Update/Remove/Upload as writes, everything else read
     rec.cfg.setdefault("rules", []).insert(0, {"host": "*", "path_regex": r"/(Mutate|Create|Update|Remove|Delete|Upload|Apply|Set)\w*$", "kind": "write"})
     rec.cfg["rules"].append({"host": "*", "path_regex": r"^/[\w.]+/(Search|Get|List|Generate|Suggest|Query)\w*$", "kind": "read"})
@@ -1110,7 +1110,7 @@ def install(trail_dir=None, why=None):
         return _installed
     d = store.find_dir(trail_dir)
     if d is None:
-        raise RuntimeError("docket: no trail directory. Run `docket init` or set DOCKET_DIR.")
+        raise RuntimeError("deedum: no trail directory. Run `deedum init` or set DEEDUM_DIR.")
     rec = Recorder(d, why=why)
     _hook_requests(rec); _hook_httpx(rec); _hook_urllib(rec); _hook_grpc(rec); _hook_urllib3(rec)
     _hook_http_client(rec); _hook_aiohttp(rec)

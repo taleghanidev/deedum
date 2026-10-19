@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""curl shim installed on PATH by `docket run`: records the request and response, then behaves
+"""curl shim installed on PATH by `deedum run`: records the request and response, then behaves
 exactly like the real curl (same stdout, stderr and exit code)."""
 import os, sys, subprocess, tempfile, shlex, time, re
-_pkg = os.environ.get("DOCKET_PKG")
+_pkg = os.environ.get("DEEDUM_PKG")
 if _pkg and _pkg not in sys.path:
     sys.path.insert(0, _pkg)
 
 def real_curl():
     here = os.path.dirname(os.path.abspath(__file__))
-    shim_bin = os.environ.get("DOCKET_SHIM_DIR")
+    shim_bin = os.environ.get("DEEDUM_SHIM_DIR")
     for p in os.environ.get("PATH", "").split(os.pathsep):
         if not p or os.path.abspath(p) == here or (shim_bin and os.path.realpath(p) == os.path.realpath(shim_bin)):
             continue
@@ -16,7 +16,7 @@ def real_curl():
         if os.path.isfile(c) and os.access(c, os.X_OK):
             try:
                 with open(c, "rb") as f:
-                    if b"# docket shim:" in f.read(200):
+                    if b"# deedum shim:" in f.read(200):
                         continue   # a wrapper of ours, not curl
             except OSError:
                 pass
@@ -49,7 +49,7 @@ def expand_config(argv, depth=0):
             except OSError:
                 lines = None
             if lines is None or depth > 4:
-                out.append("--docket-unreadable-config")
+                out.append("--deedum-unreadable-config")
             else:
                 inner = []
                 for ln in lines:
@@ -149,7 +149,7 @@ def main():
             method, url, headers, body, out = parse(list(seg))
         except Exception:
             method, url, headers, body, out = "?", None, {}, None, None
-        if "--docket-unreadable-config" in seg or any(x in seg or x.startswith(x2) for x in ("--variable", "--expand-url", "--expand-data") for x2 in (x + "=",)):
+        if "--deedum-unreadable-config" in seg or any(x in seg or x.startswith(x2) for x in ("--variable", "--expand-url", "--expand-data") for x2 in (x + "=",)):
             method, url = "?", url or "unclassifiable-request"   # a URL built from variables cannot be gated by its text
         if url is None and not any(x in seg for x in ("--version", "-V", "--help", "-h", "--manual", "-M")):
             url = "unclassifiable-request"; method = "?"      # no URL seen: not provably anything
@@ -160,8 +160,8 @@ def main():
     why_not = None
     rec = None
     try:
-        from docket.recorder import Recorder
-        from docket import store
+        from deedum.recorder import Recorder
+        from deedum import store
         from urllib.parse import urlsplit, parse_qsl
         d = store.find_dir()
         if d:
@@ -176,22 +176,22 @@ def main():
                     method, url, headers, body = m_, url_, h_, b_
                     break
     except Exception as e:
-        if os.environ.get("DOCKET_DRY") == "1":   # fail closed
-            why_not = f"docket dry run: could not classify the request ({e})"
+        if os.environ.get("DEEDUM_DRY") == "1":   # fail closed
+            why_not = f"deedum dry run: could not classify the request ({e})"
     if why_not:
         # Refused: the request never reaches curl, even if recording the refusal fails.
         try:
             rec.blocked("http", method, u.hostname or "", path,
                         dict(parse_qsl(u.query)) if u.query else None, headers, body, why_not, via="curl")
         except Exception as e:
-            sys.stderr.write(f"[docket] could not record the refusal: {e}\n")
-        sys.stderr.write(f"[docket] {why_not}: {method} {u.hostname}{path}\n")
+            sys.stderr.write(f"[deedum] could not record the refusal: {e}\n")
+        sys.stderr.write(f"[deedum] {why_not}: {method} {u.hostname}{path}\n")
         sys.exit(7)
     # one header dump per --next segment: curl's options are per segment, --dump-header included
     hdrs = []
     cmd = [curl]
     for n, seg in enumerate(split_next(argv)):
-        h = tempfile.NamedTemporaryFile(prefix="docket-hdr-", delete=False); h.close(); hdrs.append(h.name)
+        h = tempfile.NamedTemporaryFile(prefix="deedum-hdr-", delete=False); h.close(); hdrs.append(h.name)
         cmd += (["--next"] if n else []) + ["--dump-header", h.name] + seg
     t0 = time.time()
     captured = bytearray()
@@ -261,7 +261,7 @@ def main():
                     "req_headers": h_, "req_body": b_, "status": st, "resp_body": resp if len(segments) == 1 else None,
                     "ms": ms, "error": None if code == 0 else f"curl exit {code}"})
         except Exception as e:
-            sys.stderr.write(f"[docket] curl record failed: {e}\n")
+            sys.stderr.write(f"[deedum] curl record failed: {e}\n")
     sys.exit(code)
 
 if __name__ == "__main__":
