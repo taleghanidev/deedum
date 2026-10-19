@@ -1,0 +1,6 @@
+# Test fixtures use made-up credentials on purpose (they prove redaction). Nothing real lives here.
+[extend]
+useDefault = true
+
+[allowlist]
+paths = ['''tests/test_docket\.py''', '''__pycache__''']

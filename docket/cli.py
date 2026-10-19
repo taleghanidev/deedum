@@ -5,6 +5,10 @@ from . import store, __version__
 PKG_DIR = str(pathlib.Path(__file__).resolve().parent.parent)
 SHIM_DIR = str(pathlib.Path(__file__).resolve().parent / "shim")
 NODE_HOOK = str(pathlib.Path(SHIM_DIR) / "node_hook.cjs")
+# The per-binary shims (ssh, aws, gh ...) are symlinks made at run time; they live in a folder
+# of the person's own ($DOCKET_BIN, else ~/.local/share/docket/bin), because a package folder
+# under a system Python may be read-only.
+BIN_DIR = str(pathlib.Path(os.path.expanduser(os.environ.get("DOCKET_BIN") or "~/.local/share/docket/bin")))
 MARK_START, MARK_END = "# >>> docket >>>", "# <<< docket <<<"
 
 
@@ -37,11 +41,13 @@ def _env_lines(d):
         "export DOCKET_RUN=always",
         f"export DOCKET_PKG={q(PKG_DIR)}",
         f'export PYTHONPATH={q(SHIM_DIR)}"${{PYTHONPATH:+:$PYTHONPATH}}"',
-        f'export PATH={q(SHIM_DIR)}:"$PATH"',
+        f'export PATH={q(BIN_DIR)}:{q(SHIM_DIR)}:"$PATH"',
         # Node: fetch, http and https in every node process (Next.js, scripts, SDKs).
         f'export NODE_OPTIONS="--require {NODE_HOOK}${{NODE_OPTIONS:+ $NODE_OPTIONS}}"',
-        # Survives a harness that resets PATH from a snapshot.
-        f'curl() {{ {q(str(pathlib.Path(SHIM_DIR) / "curl"))} "$@"; }}',
+        # Survives a harness that resets PATH from a snapshot: one function per shim that exists
+        # (made here if it can be; a function for a missing file would shadow the real binary).
+        "; ".join([f'curl() {{ {q(str(pathlib.Path(SHIM_DIR) / "curl"))} "$@"; }}'] +
+                  [f'{n}() {{ {q(str(pathlib.Path(BIN_DIR) / n))} "$@"; }}' for n in ensure_exec_shims()]),
     ]
 
 
@@ -55,6 +61,7 @@ def cmd_setup(args):
     if not store.git_root(d):
         subprocess.run(["git", "init", "-q", str(d)], check=False)
         print(store.git_commit(d, "docket: start the trail"))
+    ensure_exec_shims()
     guard = {"agents": '[ -n "$CLAUDECODE$CODEX_SANDBOX$CURSOR_AGENT$DOCKET_ON" ]', "always": "true"}[args.when]
     lines = _env_lines(d)
     # The trail location is exported for every shell, so `docket log` works in any terminal;
@@ -119,11 +126,21 @@ def cmd_run(args):
     if args.dry:
         env["DOCKET_DRY"] = "1"
     env["PYTHONPATH"] = SHIM_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    env["PATH"] = SHIM_DIR + os.pathsep + env.get("PATH", "")
+    env["PATH"] = BIN_DIR + os.pathsep + SHIM_DIR + os.pathsep + env.get("PATH", "")
     if NODE_HOOK not in env.get("NODE_OPTIONS", ""):
         env["NODE_OPTIONS"] = f'--require "{NODE_HOOK}"' + (" " + env["NODE_OPTIONS"] if env.get("NODE_OPTIONS") else "")
     args.command = _merge_pythonpath(args.command)
     _install_pth(args.command)
+    have = ensure_exec_shims()
+    idx, first = next(((i, t) for i, t in enumerate(args.command) if t != "env" and "=" not in t), (None, ""))
+    if os.sep in first and os.path.basename(first) in EXEC_SHIMS and os.path.basename(first) in have:
+        # `/usr/local/bin/aws ...` would skip the shim on PATH: run the shim, which runs that binary
+        env["DOCKET_REAL_BIN"] = first
+        args.command[idx] = os.path.basename(first)
+    if args.dry and os.path.basename(first) in EXEC_SHIMS and os.path.basename(first) not in have:
+        # Fail closed: without its shim the real binary would run, and a dry run promised it would not.
+        sys.exit(f"docket run --dry: the {os.path.basename(first)} shim could not be made in {BIN_DIR} "
+                 f"(set DOCKET_BIN to a writable folder); refusing to run the real binary")
     started = store.now_iso()
     try:
         code = subprocess.call(args.command, env=env)
@@ -135,10 +152,10 @@ def cmd_run(args):
     writes = [r for r in calls if r["kind"] == "write"]
     blocked = [r for r in calls if r.get("status") == "BLOCKED"]
     hosts = sorted({r["host"] for r in calls})
-    why = args.why or store.get_session_why(d) or ""
+    from .recorder import scrub_values, scrub_argv_list, scrub_prose, Recorder
+    why = scrub_prose(args.why or store.get_session_why(d) or "")
     proj = store.project_of()
-    from .recorder import scrub_values
-    argv = scrub_values(" ".join(shlex.quote(a) for a in args.command))[:2000]
+    argv = Recorder(d).scrub_argv(scrub_argv_list(args.command))[:2000]
     # Every `docket run` leaves a command record, even when nothing was captured: a compiled
     # binary (the aws CLI, gh, terraform) makes calls no hook can see, and the command, its
     # reason and its exit code are still the record of what was done.
@@ -147,13 +164,11 @@ def cmd_run(args):
            "started": started, "ended": store.now_iso(), "calls": len(calls), "writes": len(writes),
            "exit": code}
     (d / "runs").mkdir(exist_ok=True)
-    with open(d / "runs" / f"{rec['ended'][:10]}.jsonl", "a", encoding="utf-8") as f:
-        f.write(scrub_values(json.dumps(rec, ensure_ascii=False)) + "\n")
+    store.append_line(d / "runs" / f"{rec['ended'][:10]}.jsonl", scrub_values(json.dumps(rec, ensure_ascii=False)))
     if not calls:
-        with open(d / "CHANGES.md", "a", encoding="utf-8") as f:
-            pj = f"[{proj['name']}] " if proj["name"] else ""
-            f.write(scrub_values(f"- {started[:16].replace('T', ' ')} · {pj}command · `{argv[:300]}` · exit {code}"
-                                 f"{' · why: ' + why if why else ''} · no API calls captured (run {run_id})\n"))
+        pj = f"[{proj['name']}] " if proj["name"] else ""
+        store.append_line(d / "CHANGES.md", scrub_values(f"- {started[:16].replace('T', ' ')} · {pj}command · `{argv[:300]}` · exit {code}"
+                                                         f"{' · why: ' + why if why else ''} · no API calls captured (run {run_id})"))
     print(f"\n[docket] run {run_id}{' (dry)' if args.dry else ''}: {len(calls)} calls ({len(writes)} writes"
           f"{f', {len(blocked)} blocked' if blocked else ''}) to {', '.join(hosts) or 'nothing captured'}; exit {code}",
           file=sys.stderr)
@@ -164,7 +179,7 @@ def cmd_run(args):
         print("[docket]   no hookable calls (compiled binary?): the command and reason were recorded", file=sys.stderr)
     cfg = store.load_config(d)
     if args.commit or cfg.get("auto_commit"):
-        msg = f"docket: {why or ' '.join(args.command)[:60]}"
+        msg = f"docket: {why or argv[:60]}"
         body = f"\n\nrun {run_id}: {len(calls)} calls, {len(writes)} writes, exit {code}\n" + "\n".join(
             f"- {w['method']} {w['host']}{w['path']} -> {w['status'] or w['error']} ({w['id']})" for w in writes)
         print("[docket] git:", store.git_commit(d, msg + body), file=sys.stderr)
@@ -179,6 +194,38 @@ def _merge_pythonpath(cmd):
             tok = "PYTHONPATH=" + SHIM_DIR + os.pathsep + tok[len("PYTHONPATH="):]
         out.append(tok)
     return out
+
+
+def hook_source():
+    """docket_hook.py with this checkout's package path pinned in: the planted hook loads docket
+    from here and nowhere else, whatever DOCKET_PKG says."""
+    src = (pathlib.Path(SHIM_DIR) / "docket_hook.py").read_text()
+    return src.replace("_EXPECTED = None", f"_EXPECTED = {PKG_DIR!r}", 1)
+
+
+def plant_hook(site=None, quiet=True):
+    """Write the env-gated hook into a site-packages (this interpreter's by default). Returns
+    True when something was written. Set DOCKET_NO_PTH=1 to never plant it."""
+    if os.environ.get("DOCKET_NO_PTH"):
+        return False
+    if site is None:
+        import sysconfig
+        site = sysconfig.get_paths()["purelib"]
+    site = pathlib.Path(site)
+    if not site.is_dir():
+        return False
+    hook, pth, src = site / "docket_hook.py", site / "docket_hook.pth", hook_source()
+    wrote = False
+    try:
+        if not hook.exists() or hook.read_text() != src:
+            hook.write_text(src); wrote = True
+        if not pth.exists():
+            pth.write_text("import docket_hook\n"); wrote = True
+    except OSError:
+        return False
+    if wrote and not quiet:
+        print(f"[docket] hook installed in {site} (DOCKET_NO_PTH=1 prevents this; docket unhook removes it)", file=sys.stderr)
+    return wrote
 
 
 def _install_pth(cmd):
@@ -198,18 +245,31 @@ def _install_pth(cmd):
     try:
         site = subprocess.run([path, "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
                               capture_output=True, text=True, timeout=20).stdout.strip()
-        if not site or not os.path.isdir(site):
-            return
-        hook = pathlib.Path(site) / "docket_hook.py"
-        pth = pathlib.Path(site) / "docket_hook.pth"
-        src = pathlib.Path(SHIM_DIR) / "docket_hook.py"
-        if not hook.exists() or hook.read_text() != src.read_text():
-            hook.write_text(src.read_text())
-        if not pth.exists():
-            pth.write_text("import docket_hook\n")
-            print(f"[docket] hook installed in {site}", file=sys.stderr)
+        if site:
+            plant_hook(site, quiet=False)
     except (PermissionError, OSError, subprocess.TimeoutExpired):
         pass
+
+
+def cmd_unhook(args):
+    """Remove every docket_hook.pth this machine's Pythons have: this interpreter's, plus any
+    path given. `docket unhook --find` lists the ones under ~ without removing them."""
+    import sysconfig
+    sites = [pathlib.Path(sysconfig.get_paths()["purelib"])] + [pathlib.Path(p) for p in args.sites]
+    if args.find:
+        home = pathlib.Path.home()
+        sites += [p.parent for p in home.glob("**/site-packages/docket_hook.pth")]
+    n = 0
+    for site in sites:
+        for name in ("docket_hook.pth", "docket_hook.py"):
+            f = site / name
+            if f.exists():
+                if args.find and not args.remove:
+                    print(f)
+                else:
+                    f.unlink(); n += 1; print(f"removed {f}")
+    if not args.find or args.remove:
+        print(f"{n} file(s) removed")
 
 
 def cmd_env(args):
@@ -232,22 +292,69 @@ def cmd_why(args):
         prompt = " ".join(str(data.get("prompt") or "").split())
         if not prompt or prompt.startswith("/"):
             return
-        from .recorder import scrub_values
-        text = scrub_values(prompt)
+        from .recorder import scrub_prose
+        text = scrub_prose(prompt)
         why = "asked: " + (text[:200] + ("…" if len(text) > 200 else ""))
-        store.set_session_why(d, why, key=data.get("session_id"))
+        store.set_session_why(d, why, key=data.get("session_id"), agent=_agent_from_hook(data))
         return
     if args.clear:
         store.set_session_why(d, None)
         print("reason cleared for this session")
         return
     if args.text:
-        why = " ".join(args.text)
+        from .recorder import scrub_prose
+        why = scrub_prose(" ".join(args.text))
         store.set_session_why(d, why)
         print(f"reason for this session (next {store.WHY_TTL_HOURS}h, until changed): {why}")
         return
     cur = os.environ.get("DOCKET_WHY") or store.get_session_why(d)
     print(cur or "(no reason set: docket why \"what you are doing\")")
+
+
+def _agent_from_hook(data):
+    """What a Claude Code hook payload says about the agent: its session, the folder the
+    session was started in, and the model (from the transcript, which names it on every
+    assistant message; the payload itself does not)."""
+    out = {"name": "claude-code", "session": data.get("session_id"), "started_in": data.get("cwd"), "model": data.get("model")}
+    if not out["model"] and data.get("transcript_path"):
+        try:
+            with open(data["transcript_path"], "rb") as f:
+                f.seek(max(0, os.path.getsize(data["transcript_path"]) - 200_000))
+                m = re.findall(rb'"model"\s*:\s*"([^"]{3,80})"', f.read())
+                if m:
+                    out["model"] = m[-1].decode()
+        except Exception:
+            pass
+    return {k: v for k, v in out.items() if v}
+
+
+# Binaries no hook can see from inside (ssh, the AWS CLI with SSM, gh, terraform ...): a shim
+# of the same name on PATH records the command as a call and runs the real one. `git` is
+# recorded only for push and remote-changing subcommands (shim/_exec).
+EXEC_SHIMS = ["ssh", "scp", "sftp", "rsync", "aws", "gh", "wrangler", "terraform", "kubectl", "helm",
+              "gcloud", "az", "flyctl", "fly", "vercel", "netlify", "heroku", "doctl", "stripe", "git"]
+
+
+def ensure_exec_shims():
+    """Make the per-binary symlinks to shim/_exec in BIN_DIR. Returns the names that exist."""
+    src = pathlib.Path(SHIM_DIR) / "_exec"
+    have = []
+    try:
+        pathlib.Path(BIN_DIR).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return have
+    for name in EXEC_SHIMS:
+        link = pathlib.Path(BIN_DIR) / name
+        try:
+            if link.is_symlink() and os.readlink(link) != str(src):
+                link.unlink()   # an older docket's shim: point it at this one
+            if not (link.is_symlink() or link.exists()):
+                link.symlink_to(src)
+            if link.exists():
+                have.append(name)
+        except OSError:
+            pass
+    return have
 
 
 def cmd_hook(args):
@@ -553,8 +660,10 @@ def cmd_scan(args):
     d = _dir(args)
     hits = []
     for sub in ("calls", "runs"):
-        for f in sorted((d / sub).glob("*.jsonl")):
-            lines = f.read_text(encoding="utf-8").splitlines()
+        for f in sorted(list((d / sub).glob("*.jsonl")) + list((d / sub).glob("*.jsonl.gz"))):   # compacted days too
+            opener = gzip.open if f.suffix == ".gz" else open
+            with opener(f, "rt", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
             changed = False
             for i, ln in enumerate(lines):
                 found = [n for v, n in _secret_values() if v in ln] + [r.pattern[:30] for r in _VALUE_RES if r.search(ln)]
@@ -565,7 +674,8 @@ def cmd_scan(args):
                         lines[i] = scrub_values(ln)
                         changed = True
             if changed:
-                f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                with opener(f, "wt", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines) + "\n")
     for name, rid, found in hits[:200]:
         print(f"{name} {rid}: {', '.join(found)}")
     print(f"{len(hits)} record(s) with something credential-shaped" + (" (rewritten)" if args.fix and hits else ""))
@@ -573,11 +683,11 @@ def cmd_scan(args):
         print("The files are clean now; git history still holds the old lines (rewrite it or rotate the key).")
 
 
-def cmd_compact(args):
-    """gzip day files older than --older (reading tools read .gz too); optionally drop the
-    response bodies of reads in them, which are most of the bytes and rarely needed."""
-    d = _dir(args)
-    cutoff = store.parse_since(args.older)[:10]
+def compact(d, older, strip_read_bodies=False):
+    """gzip day files older than `older` (reading tools read .gz too); optionally drop the
+    response bodies of reads in them, which are most of the bytes and rarely needed.
+    Returns (files, bytes saved)."""
+    cutoff = store.parse_since(older)[:10]
     n, saved = 0, 0
     for sub in ("calls", "runs"):
         for f in sorted((d / sub).glob("*.jsonl")):
@@ -585,7 +695,7 @@ def cmd_compact(args):
                 continue
             before = f.stat().st_size
             lines = f.read_text(encoding="utf-8").splitlines()
-            if args.strip_read_bodies and sub == "calls":
+            if strip_read_bodies and sub == "calls":
                 out = []
                 for ln in lines:
                     try:
@@ -601,7 +711,111 @@ def cmd_compact(args):
             f.unlink()
             n += 1
             saved += before - f.with_suffix(".jsonl.gz").stat().st_size
+    return n, saved
+
+
+def cmd_compact(args):
+    d = _dir(args)
+    n, saved = compact(d, args.older, args.strip_read_bodies)
     print(f"compacted {n} day file(s), {saved / 1e6:.1f} MB smaller. Commit with: docket commit")
+
+
+def cmd_prune(args):
+    """Drop the trail before a date: the day files, and their lines in CHANGES.md. By default the
+    writes are kept (they are the point of the trail) and only reads go; --writes-too drops
+    everything. The git history still holds the old lines until --rewrite-history (which
+    rewrites the trail's own repository, when the trail IS a repository, with git-filter-repo)."""
+    d = _dir(args)
+    if args.rewrite_history and not args.writes_too:
+        sys.exit("docket prune: --rewrite-history removes whole day files from every commit, so it needs --writes-too "
+                 "(otherwise the writes you asked to keep would go with them)")
+    cutoff = store.parse_since(args.before)[:10]
+    files, kept, dropped = [], 0, 0
+    for sub in ("calls", "runs"):
+        for f in sorted(list((d / sub).glob("*.jsonl")) + list((d / sub).glob("*.jsonl.gz"))):
+            if f.name.split(".")[0] >= cutoff:
+                continue
+            if args.writes_too:
+                files.append(f)
+                continue
+            if sub == "runs":
+                continue  # a run line is small and names the writes: keep it with them
+            opener = gzip.open if f.suffix == ".gz" else open
+            with opener(f, "rt", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            keep = []
+            for ln in lines:
+                try:
+                    if json.loads(ln).get("kind") == "write":
+                        keep.append(ln); kept += 1; continue
+                except ValueError:
+                    pass
+                dropped += 1
+            if keep:
+                if not args.dry_run:
+                    with opener(f, "wt", encoding="utf-8") as fh:
+                        fh.write("\n".join(keep) + "\n")
+            else:
+                files.append(f)
+    if args.dry_run:
+        print(f"would delete {len(files)} day file(s) before {cutoff}" + ("" if args.writes_too else f", keep {kept} writes, drop {dropped} reads"))
+        for f in files:
+            print("  ", f.relative_to(d))
+        return
+    for f in files:
+        f.unlink()
+    ch = d / "CHANGES.md"
+    if args.writes_too and ch.exists():
+        lines = ch.read_text(encoding="utf-8").splitlines()
+        out = [ln for ln in lines if not (ln.startswith("- ") and ln[2:12] < cutoff)]
+        ch.write_text("\n".join(out) + "\n", encoding="utf-8")
+        print(f"CHANGES.md: {len(lines) - len(out)} line(s) dropped")
+    print(f"deleted {len(files)} day file(s) before {cutoff}" + ("" if args.writes_too else f"; kept {kept} writes, dropped {dropped} reads"))
+    msg = f"docket: prune before {cutoff}" + (" (writes too)" if args.writes_too else "")
+    print("git:", store.git_commit(d, msg))
+    if args.rewrite_history:
+        root = store.git_root(d)
+        if not root or root != d:
+            sys.exit("--rewrite-history only when the trail is its own repository (docket setup makes it one)")
+        import shutil
+        if not shutil.which("git-filter-repo"):
+            sys.exit("--rewrite-history needs git-filter-repo (pipx install git-filter-repo)")
+        paths = [f"{sub}/{day}" for sub in ("calls", "runs") for day in _days_before(d, cutoff)]
+        # Two passes: the day files go out of every commit, and the period's lines go out of every
+        # historical CHANGES.md (they name hosts, paths and reasons too).
+        import tempfile
+        rules = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        rules.write("".join(f"regex:{pat}==>\n" for pat in _change_line_patterns(d, cutoff))); rules.close()
+        cmd = ["git", "-C", str(d), "filter-repo", "--force", "--replace-text", rules.name]
+        if paths:
+            cmd += ["--invert-paths"] + [a for p in paths for a in ("--path", p)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        os.unlink(rules.name)
+        print("history rewritten (day files and CHANGES.md lines)" if r.returncode == 0 else f"history rewrite failed: {r.stderr.strip()[-400:]}")
+        subprocess.run(["git", "-C", str(d), "reflog", "expire", "--expire=now", "--all"], check=False)
+        subprocess.run(["git", "-C", str(d), "gc", "--prune=now", "-q"], check=False)
+
+
+def _change_line_patterns(d, cutoff):
+    """Regexes (git-filter-repo --replace-text, one per line, multiline) matching every
+    `- YYYY-MM-DD …` line of CHANGES.md dated before the cutoff: every earlier year, the earlier
+    months of the cutoff year, the earlier days of the cutoff month. Dates, not commit dates: a
+    record can predate the commit that first held it."""
+    cy, cm, cd = int(cutoff[:4]), int(cutoff[5:7]), int(cutoff[8:10])
+    out = []
+    if cy > 2000:
+        out.append(r"(?m)^- (" + "|".join(str(y) for y in range(2000, cy)) + r")-\d\d-\d\d .*\n")
+    if cm > 1:
+        out.append(rf"(?m)^- {cy:04d}-(" + "|".join(f"{x:02d}" for x in range(1, cm)) + r")-\d\d .*\n")
+    if cd > 1:
+        out.append(rf"(?m)^- {cy:04d}-{cm:02d}-(" + "|".join(f"{x:02d}" for x in range(1, cd)) + r") .*\n")
+    return out
+
+
+def _days_before(d, cutoff):
+    out = subprocess.run(["git", "-C", str(d), "log", "--all", "--name-only", "--format=", "--", "calls", "runs"],
+                         capture_output=True, text=True).stdout.split()
+    return sorted({p.split("/", 1)[1] for p in out if "/" in p and p.split("/", 1)[1][:10] < cutoff})
 
 
 def cmd_migrate(args):
@@ -660,10 +874,73 @@ def cmd_status(args):
     print(f"project:  {store.project_of()['name'] or '(none)'}")
 
 
+def cmd_mcp(args):
+    from . import mcp
+    mcp.serve(_dir(args))
+
+
+def cmd_approvals(args):
+    from . import policy
+    rows = policy.list_approvals(_dir(args), pending_only=not args.all)
+    if args.json:
+        _out_json(rows); return
+    if not rows:
+        print("no pending approvals"); return
+    for r in rows:
+        ag = r.get("agent") or {}
+        print(f"{r['id']}  {r['method']} {r['host']}{r.get('path', '')}  [{r.get('project') or '-'}]  {r.get('why') or '(no reason)'}"
+              f"  {ag.get('name') or ''} {ag.get('session', '')[:8]}  {r['state']}")
+
+
+def cmd_approve(args):
+    from . import policy
+    for aid in args.ids:
+        r = policy.settle(_dir(args), aid, "denied" if args.cmd == "deny" else "approved")
+        print(f"{aid}: {r['state'] if r else 'not found'}")
+
+
+def cmd_policy(args):
+    from . import policy
+    d = _dir(args)
+    pol = policy.load(store.load_config(d))
+    if args.json:
+        _out_json(pol); return
+    if not pol:
+        print("no policy: put rules in .docket-policy.json in a repo, or `policy` in the trail's config.json (docket policy --example)")
+    else:
+        print(f"from {pol.get('_file') or 'config.json'}:")
+        for r in pol.get("rules") or []:
+            what = "deny" if r.get("deny") else "approve" if r.get("approve") else "allow" if r.get("allow") else "?"
+            print(f"  {what:8} {r.get('host', '*'):28} {','.join(r.get('methods') or ['*']):10} project={r.get('project', '*')}"
+                  f"{'  unless a reason is set' if r.get('unless_why') else ''}{'  ' + r['note'] if r.get('note') else ''}")
+        for b in pol.get("budgets") or []:
+            print(f"  budget   {b.get('host', '*'):28} {b.get('writes')} writes per {b.get('per', 'session')}")
+        if pol.get("notify"):
+            print("  notify   (set)")
+    if args.example:
+        print(policy.__doc__.split("{", 1)[1].rsplit("}", 1)[0].join("{}"))
+
+
+def cmd_html(args):
+    from . import html as h
+    d = _dir(args)
+    since = store.parse_since(args.since)
+    rows = list(_filter(store.iter_records(d, "calls", since=since), args, since))
+    page = h.render(rows, title=args.title or f"Docket · {store.project_of()['name'] or d.name}", since=since)
+    out = pathlib.Path(args.out or "docket.html")
+    out.write_text(page, encoding="utf-8")
+    print(f"wrote {out} ({len(rows)} calls, {sum(1 for r in rows if r['kind'] == 'write')} writes)")
+
+
 def cmd_commit(args):
     d = _dir(args, required=not args.quiet)
     if d is None:
         return
+    days = store.load_config(d).get("compact_after_days") or 0
+    if days and not args.no_compact:
+        n, saved = compact(d, f"{int(days)}d", strip_read_bodies=True)
+        if n and not args.quiet:
+            print(f"compacted {n} day file(s) older than {days}d ({saved / 1e6:.1f} MB smaller)")
     out = store.git_commit(d, args.message or "docket: record API calls")
     if not args.quiet:
         print(out)
@@ -740,10 +1017,29 @@ def main(argv=None):
     a.set_defaults(f=cmd_scan)
     a = sp.add_parser("compact", help="gzip old days (and optionally drop read response bodies)"); a.add_argument("--older", default="14d")
     a.add_argument("--strip-read-bodies", action="store_true"); a.set_defaults(f=cmd_compact)
+    a = sp.add_parser("prune", help="drop the trail before a date (reads by default; --writes-too for everything)")
+    a.add_argument("--before", required=True, help="a date, or 30d / 8w")
+    a.add_argument("--writes-too", action="store_true", help="drop writes and their CHANGES.md lines as well")
+    a.add_argument("--rewrite-history", action="store_true", help="also remove the days from the trail's git history (git-filter-repo)")
+    a.add_argument("--dry-run", action="store_true"); a.set_defaults(f=cmd_prune)
+    a = sp.add_parser("unhook", help="remove the docket_hook.pth files planted in site-packages")
+    a.add_argument("sites", nargs="*", help="extra site-packages directories")
+    a.add_argument("--find", action="store_true", help="list every one under ~ (with --remove: remove them)")
+    a.add_argument("--remove", action="store_true"); a.set_defaults(f=cmd_unhook)
     a = sp.add_parser("migrate", help="add project/folder/service to records made before 0.2"); a.set_defaults(f=cmd_migrate)
     a = sp.add_parser("status", help="where the trail is, its size, and what this shell records"); a.set_defaults(f=cmd_status)
     a = sp.add_parser("env", help="print the shell exports (setup --write installs them)"); a.set_defaults(f=cmd_env)
-    a = sp.add_parser("commit", help="git commit whatever the trail has recorded"); a.add_argument("-m", "--message")
+    a = sp.add_parser("mcp", help="serve the trail to an agent over MCP (stdio)"); a.set_defaults(f=cmd_mcp)
+    a = sp.add_parser("approvals", help="writes waiting for a person (policy `approve` rules)"); a.add_argument("--all", action="store_true")
+    a.add_argument("--json", action="store_true"); a.set_defaults(f=cmd_approvals)
+    a = sp.add_parser("approve", help="let a waiting write go"); a.add_argument("ids", nargs="+"); a.set_defaults(f=cmd_approve)
+    a = sp.add_parser("deny", help="refuse a waiting write"); a.add_argument("ids", nargs="+"); a.set_defaults(f=cmd_approve)
+    a = sp.add_parser("policy", help="the rules in force here: deny, approve, budgets (.docket-policy.json / config)")
+    a.add_argument("--json", action="store_true"); a.add_argument("--example", action="store_true"); a.set_defaults(f=cmd_policy)
+    a = sp.add_parser("html", help="write the timeline as one self-contained HTML page"); _filters(a, "30d")
+    a.add_argument("--out", "-o"); a.add_argument("--title"); a.set_defaults(f=cmd_html)
+    a = sp.add_parser("commit", help="git commit whatever the trail has recorded (compacts old days first; never pushes)")
+    a.add_argument("-m", "--message"); a.add_argument("--no-compact", action="store_true")
     a.add_argument("-q", "--quiet", action="store_true"); a.set_defaults(f=cmd_commit)
     args = p.parse_args(argv)
     if args.cmd == "run" and args.command and args.command[0] == "--":

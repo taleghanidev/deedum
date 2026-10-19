@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """curl shim installed on PATH by `docket run`: records the request and response, then behaves
 exactly like the real curl (same stdout, stderr and exit code)."""
-import os, sys, subprocess, tempfile, shlex, time
+import os, sys, subprocess, tempfile, shlex, time, re
 _pkg = os.environ.get("DOCKET_PKG")
 if _pkg and _pkg not in sys.path:
     sys.path.insert(0, _pkg)
@@ -24,6 +24,60 @@ ONE_ARG = DATA_FLAGS | {"-X", "--request", "-H", "--header", "-F", "--form", "--
     "--limit-rate", "-z", "--time-cond", "--resolve", "--interface", "--proto", "--tlsv1.2", "--ciphers",
     "--stderr", "--trace", "--trace-ascii", "--unix-socket", "--abstract-unix-socket", "--oauth2-bearer",
     "--aws-sigv4", "--variable", "--expand-url", "-Q", "--quote", "--request-target", "--output-dir"}
+
+def expand_config(argv, depth=0):
+    """`-K file` / `--config file`: curl reads options from the file (`url = "x"`, `request = DELETE`,
+    `-X DELETE`, `data = ...`). Without reading it the request would be invisible to the gate.
+    Each option becomes an argument; `-K -` (stdin) and an unreadable file become a marker that
+    the gate treats as an unclassifiable write."""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-K", "--config") or a.startswith("--config=") or (a.startswith("-K") and len(a) > 2):
+            f = a.split("=", 1)[1] if "=" in a else a[2:] if a.startswith("-K") and len(a) > 2 else (argv[i + 1] if i + 1 < len(argv) else "")
+            if a in ("-K", "--config"):
+                i += 1
+            try:
+                lines = open(f, encoding="utf-8", errors="replace").read().splitlines() if f and f != "-" else None
+            except OSError:
+                lines = None
+            if lines is None or depth > 4:
+                out.append("--docket-unreadable-config")
+            else:
+                inner = []
+                for ln in lines:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    m = re.match(r"^(-{0,2}[\w.-]+)\s*(?:=|:|\s|$)\s*(.*)$", ln)   # `url = "x"`, `request: DELETE`, `-X DELETE`
+                    if not m:
+                        continue
+                    key, val = m.group(1), m.group(2).strip()
+                    if not key.startswith("-"):
+                        key = ("-" if len(key) == 1 else "--") + key
+                    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                        val = val[1:-1]
+                    inner.append(key)
+                    if val:
+                        inner.append(val)
+                out += expand_config(inner, depth + 1)   # a config file may name another config file
+            i += 1
+            continue
+        out.append(a); i += 1
+    return out
+
+
+def split_next(argv):
+    """curl runs several requests in one call separated by --next. Each gets its own gate and record."""
+    segs, cur = [], []
+    for a in argv:
+        if a in ("--next", "-:"):
+            segs.append(cur); cur = []
+        else:
+            cur.append(a)
+    segs.append(cur)
+    return segs
+
 
 def parse(argv):
     method = None; data = []; headers = {}; url = None; out = None; get = False; head = False; upload = None; form = []
@@ -81,71 +135,123 @@ def parse(argv):
 
 def main():
     argv = sys.argv[1:]
-    try:
-        method, url, headers, body, out = parse(list(argv))
-    except Exception:
-        method, url, headers, body, out = "?", None, {}, None, None
+    expanded = expand_config(argv)
+    segments = []
+    for seg in split_next(expanded):
+        try:
+            method, url, headers, body, out = parse(list(seg))
+        except Exception:
+            method, url, headers, body, out = "?", None, {}, None, None
+        if "--docket-unreadable-config" in seg or any(x in seg or x.startswith(x2) for x in ("--variable", "--expand-url", "--expand-data") for x2 in (x + "=",)):
+            method, url = "?", url or "unclassifiable-request"   # a URL built from variables cannot be gated by its text
+        if url is None and not any(x in seg for x in ("--version", "-V", "--help", "-h", "--manual", "-M")):
+            url = "unclassifiable-request"; method = "?"      # no URL seen: not provably anything
+        segments.append((method, url, headers, body, out))
+    method, url, headers, body, out = segments[0]
     curl = real_curl()
     # Dry run / require-a-reason: a refused write never reaches the real curl.
-    if url:
-        try:
-            from docket.recorder import Recorder
-            from docket import store
-            from urllib.parse import urlsplit, parse_qsl
-            d = store.find_dir()
-            if d:
-                u = urlsplit(url if "://" in url else "http://" + url)
-                rec = Recorder(d)
+    why_not = None
+    rec = None
+    try:
+        from docket.recorder import Recorder
+        from docket import store
+        from urllib.parse import urlsplit, parse_qsl
+        d = store.find_dir()
+        if d:
+            rec = Recorder(d)
+            for (m_, url_, h_, b_, _) in segments:
+                if not url_:
+                    continue
+                u = urlsplit(url_ if "://" in url_ else "http://" + url_)
                 path = u.path or "/"
-                why_not = rec.gate(method, u.hostname or "", path, body)
+                why_not = rec.gate(m_ if m_ != "?" else "UNKNOWN", u.hostname or "", path, b_)
                 if why_not:
-                    rec.blocked("http", method, u.hostname or "", path,
-                                dict(parse_qsl(u.query)) if u.query else None, headers, body, why_not)
-                    sys.stderr.write(f"[docket] {why_not}: {method} {u.hostname}{path}\n")
-                    sys.exit(7)
-        except SystemExit:
-            raise
-        except Exception:
-            pass
-    hdr = tempfile.NamedTemporaryFile(prefix="docket-hdr-", delete=False); hdr.close()
-    cmd = [curl, "--dump-header", hdr.name] + argv
+                    method, url, headers, body = m_, url_, h_, b_
+                    break
+    except Exception as e:
+        if os.environ.get("DOCKET_DRY") == "1":   # fail closed
+            why_not = f"docket dry run: could not classify the request ({e})"
+    if why_not:
+        # Refused: the request never reaches curl, even if recording the refusal fails.
+        try:
+            rec.blocked("http", method, u.hostname or "", path,
+                        dict(parse_qsl(u.query)) if u.query else None, headers, body, why_not, via="curl")
+        except Exception as e:
+            sys.stderr.write(f"[docket] could not record the refusal: {e}\n")
+        sys.stderr.write(f"[docket] {why_not}: {method} {u.hostname}{path}\n")
+        sys.exit(7)
+    # one header dump per --next segment: curl's options are per segment, --dump-header included
+    hdrs = []
+    cmd = [curl]
+    for n, seg in enumerate(split_next(argv)):
+        h = tempfile.NamedTemporaryFile(prefix="docket-hdr-", delete=False); h.close(); hdrs.append(h.name)
+        cmd += (["--next"] if n else []) + ["--dump-header", h.name] + seg
     t0 = time.time()
     captured = bytearray()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    # a signal to this shim reaches the real curl (SIGINT aimed at this PID included)
+    import signal
+    def forward(sig, frame):
+        try: proc.send_signal(sig)
+        except Exception: pass
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try: signal.signal(sig, forward)
+        except Exception: pass
     # stream stdout through unchanged while keeping a copy
+    broken = False
     while True:
         chunk = proc.stdout.read(65536)
         if not chunk: break
-        sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+        if not broken:
+            try:
+                sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+            except BrokenPipeError:
+                broken = True   # `curl ... | head`: the reader is gone; curl itself would stop with 23
+                try: proc.terminate()
+                except Exception: pass
         if len(captured) < 4_000_000: captured.extend(chunk)
     code = proc.wait()
+    if broken:
+        code = 23
+        try:
+            sys.stdout = open(os.devnull, "w")   # nothing else may try the closed pipe at exit
+        except Exception:
+            pass
+    if code < 0:
+        code = 128 - code   # killed by a signal: the conventional status, as curl itself would show
     ms = int((time.time() - t0) * 1000)
     status = None
-    try:
-        for line in open(hdr.name, encoding="latin-1"):
-            if line.startswith("HTTP/"):
-                parts = line.split()
-                if len(parts) > 1 and parts[1].isdigit(): status = int(parts[1])
-    except Exception: pass
-    finally:
-        try: os.unlink(hdr.name)
+    statuses = []   # the final status of each segment (a redirect chain ends on its last status)
+    for name in hdrs:
+        st = None
+        try:
+            for line in open(name, encoding="latin-1"):
+                if line.startswith("HTTP/"):
+                    parts = line.split()
+                    if len(parts) > 1 and parts[1].isdigit():
+                        st = int(parts[1])
         except Exception: pass
+        finally:
+            try: os.unlink(name)
+            except Exception: pass
+        statuses.append(st)
+    status = statuses[0] if statuses else None
     resp = bytes(captured)
     if out and out != "-":
         try:
             with open(out, "rb") as f: resp = f.read(4_000_000)
         except Exception: resp = None
-    if url:
+    if rec is not None:
         try:
-            from docket.recorder import Recorder
-            from docket import store
             from urllib.parse import urlsplit, parse_qsl
-            d = store.find_dir()
-            if d:
-                u = urlsplit(url if "://" in url else "http://" + url)
-                Recorder(d).record({"transport": "http", "method": method, "host": u.hostname or "",
+            for n, (m_, url_, h_, b_, _) in enumerate(segments):
+                if not url_:
+                    continue
+                u = urlsplit(url_ if "://" in url_ else "http://" + url_)
+                st = statuses[n] if n < len(statuses) else None
+                rec.record({"transport": "http", "via": "curl", "method": m_, "host": u.hostname or "",
                     "path": u.path or "/", "query": dict(parse_qsl(u.query)) if u.query else None,
-                    "req_headers": headers, "req_body": body, "status": status, "resp_body": resp,
+                    "req_headers": h_, "req_body": b_, "status": st, "resp_body": resp if len(segments) == 1 else None,
                     "ms": ms, "error": None if code == 0 else f"curl exit {code}"})
         except Exception as e:
             sys.stderr.write(f"[docket] curl record failed: {e}\n")

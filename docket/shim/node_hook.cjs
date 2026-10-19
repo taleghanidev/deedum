@@ -51,8 +51,7 @@
     read_response_max: 2048,
     write_request_max: 262144,
     write_response_max: 65536,
-    read_path_regex:
-      '(?i)(query|search|report|get[A-Z_/]|/get$|list|status|download|lookup|stream|whoami|/me$|token|oauth|auth)',
+    read_path_regex: '(?i)(query|search|report|get[A-Z_/]|/get$|list|download|lookup|whoami|/me$)',
     rules: [],
     redact_headers: ['authorization', 'developertoken', 'developer-token', 'x-api-key', 'api-key', 'apikey',
       'cookie', 'set-cookie', 'x-auth-token', 'authenticationtoken', 'proxy-authorization', 'x-goog-api-key'],
@@ -200,11 +199,55 @@
     /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
     /\b(AKIA|ASIA)[0-9A-Z]{16}\b/g,
     /\bre_[A-Za-z0-9]{8}_[A-Za-z0-9]{16,}/g,
+    /(?<!\d)\d{8,12}:AA[A-Za-z0-9_-]{30,}/g,
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
     /\b[a-z]{2,6}_[A-Za-z0-9]{32,}\b/g,
   ]
   const NAMEVAL_RE =
     /(?<!<)\b([A-Za-z0-9_-]*(?:token|secret|passw|credential|auth[-_]?key|api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?key|websocket-key)[A-Za-z0-9_-]*\s*[:=]\s*)(?!<redacted>|<secret:)[^\s"'&<>,;\\]{6,}/gi
+  const PROSE_SECRET_RE = /\b(password|passwd|passphrase|pin|otp|secret|token|api[ -]?key|access[ -]?key|private[ -]?key)((?:\s+(?:is|was|of|for|=|:|to))?\s*)(?:"[^"]{1,200}"|'[^']{1,200}'|`[^`]{1,200}`|[^\s"'`,;]{4,})/gi
+  const scrubProse = (text) => scrubValues(text || '').replace(PROSE_SECRET_RE, (_m, a, b) => `${a}${b}<redacted>`)
+  const SECRET_FLAG = /^--?[a-z0-9-]*(secret|token|passw|password|passphrase|credential|api-?key|access-?key|private-?key|client-?key|auth-?key|session-?key|signing-?key|master-?key|pin|otp)[a-z0-9-]*$/i
+  const SECRET_FLAG_IN = /(^|\s)--?[a-z0-9-]*(secret|token|passw|password|passphrase|credential|api-?key|access-?key|private-?key|client-?key|auth-?key|session-?key|signing-?key|master-?key|pin|otp)[a-z0-9-]*(=|\s)/i
+  const P_IS_PASSWORD = new Set(['az', 'sshpass', 'mysql', 'mysqldump', 'mysqladmin', 'mariadb', 'smbclient', 'ftp', 'lftp', 'docker', 'podman', 'mongo', 'mongosh', 'redis-cli', 'cqlsh', 'sqlcmd', 'wget', 'htpasswd', 'openconnect', 'rclone', 'curl'])
+  function shellSplit(text) {
+    const out = []
+    let cur = ''
+    let q = null
+    let had = false
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i]
+      if (q) {
+        if (c === q) q = null
+        else if (c === '\\' && q === '"' && i + 1 < text.length) cur += text[++i]
+        else cur += c
+      } else if (c === '"' || c === "'") { q = c; had = true }
+      else if (c === '\\' && i + 1 < text.length) cur += text[++i]
+      else if (/\s/.test(c)) { if (cur || had) out.push(cur); cur = ''; had = false }
+      else cur += c
+    }
+    if (q) throw new Error('unterminated quote')
+    if (cur || had) out.push(cur)
+    return out
+  }
+  const shq = (x) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(x) ? x : `'${x.replace(/'/g, "'\\''")}'`)
+  function scrubArgvList(argv, depth = 0, quote = true) {
+    const out = []
+    const exe = path.basename(argv[0] || '')
+    const pIsPw = P_IS_PASSWORD.has(exe)
+    for (let i = 0; i < argv.length; i++) {
+      const a = String(argv[i])
+      if (a.startsWith('-') && a.includes('=') && SECRET_FLAG.test(a.split('=')[0])) out.push(`${a.split('=')[0]}=<redacted>`)
+      else if (SECRET_FLAG.test(a) && i + 1 < argv.length) { out.push(a, '<redacted>'); i++ }
+      else if (pIsPw && a === '-p' && i + 1 < argv.length) { out.push(a, '<redacted>'); i++ }
+      else if (pIsPw && a.startsWith('-p') && a.length > 2 && !a.startsWith('--')) out.push('-p<redacted>')
+      else if (/[ \t\n]/.test(a) && !a.startsWith('-') && depth < 3 && SECRET_FLAG_IN.test(a)) {
+        try { out.push(scrubArgvList(shellSplit(a), depth + 1, false)) } catch { out.push('<argument omitted: could not parse it for redaction>') }
+      } else out.push(a)
+    }
+    if (!quote) return out.join(' ')
+    return out.map((x) => (x === '<redacted>' || x.startsWith('<argument omitted') ? x : shq(x))).join(' ')
+  }
   function scrubValues(text) {
     for (const [v, n] of SECRETS) {
       if (text.includes(v)) {
@@ -220,12 +263,41 @@
   // ---- record shaping ---------------------------------------------------------------------
   const REDACT_H = new Set(cfg.redact_headers.map((h) => h.toLowerCase()))
   const REDACT_B = new Set(cfg.redact_body_keys.map((h) => h.toLowerCase()))
-  const SECRET_NAME_RE = /(token|secret|passw|auth|credential|proof|signature|cookie|session|key$)/i
+  // Same rule as recorder.secret_name: split the name into words and look at the last one.
+  const LAST_WORD_SECRET = new Set(['token', 'secret', 'password', 'passwd', 'passphrase', 'pwd', 'auth', 'authorization', 'authentication',
+    'credential', 'credentials', 'proof', 'signature', 'sig', 'cookie', 'cookies', 'key', 'apikey', 'session', 'sessionid',
+    'sid', 'bearer', 'jwt', 'otp', 'pin', 'totp', 'mfa', 'verifier', 'challenge', 'assertion', 'nonce', 'csrf', 'xsrf'])
+  const PLURAL_QUALIFIERS = new Set(['access', 'refresh', 'api', 'auth', 'oauth', 'secret', 'session', 'id', 'bearer', 'private', 'public', 'client',
+    'service', 'personal', 'deploy', 'webhook', 'signing', 'encryption', 'master', 'app', 'user', 'account', 'ssh', 'gpg', 'pgp', 'recovery',
+    'backup', 'temporary', 'temp', 'long', 'short', 'lived', 'static', 'dynamic'])
+  const VALUE_WORDS = new Set(['value', 'values', 'string', 'str', 'data', 'hash', 'ticket', 'blob', 'bytes', 'b64', 'base64', 'hex', 'raw', 'text', 'encrypted', 'enc', 'plain', 'plaintext'])
+  const CODE_OWNERS = new Set(['authorization', 'auth', 'oauth', 'verification', 'confirmation', 'activation', 'recovery', 'reset', 'access', 'security', 'mfa', 'otp', 'backup'])
+  function secretName(name) {
+    const words = String(name).split(/[_\-\s.]+|(?<=[a-z0-9])(?=[A-Z])/).filter(Boolean).map((w) => w.toLowerCase())
+    while (words.length && /^v?\d+$/.test(words[words.length - 1])) words.pop()
+    if (!words.length) return false
+    const last = words[words.length - 1].replace(/\d+$/, '') || words[words.length - 1]
+    if (LAST_WORD_SECRET.has(last) || /(token|secret|password|passwd|sessid|sessionid)$/.test(last)) return true
+    if (last === 'id' && words.length >= 2 && ['session', 'auth', 'sess'].includes(words[words.length - 2])) return true
+    if (last === 'code' && words.length >= 2 && CODE_OWNERS.has(words[words.length - 2])) return true
+    if (last.endsWith('s')) {
+      const sing = last.slice(0, -1)
+      if (LAST_WORD_SECRET.has(sing) || /(token|secret|password)$/.test(sing)) {
+        if (words.length === 1 && sing !== 'token') return true
+        if (words.length >= 2 && PLURAL_QUALIFIERS.has(words[words.length - 2])) return true
+      }
+    }
+    if (VALUE_WORDS.has(last) && words.length >= 2) {
+      const prev = words[words.length - 2]
+      if (LAST_WORD_SECRET.has(prev) || /(token|secret|password|passwd)$/.test(prev)) return true
+    }
+    return words.length <= 3 && words.slice(0, -1).some((w) => w === 'password' || w === 'passwd' || w === 'secret')
+  }
   function redactHeaders(h) {
     const out = {}
     for (const [k, raw] of Object.entries(h || {})) {
       const v = Array.isArray(raw) ? raw.join(', ') : String(raw)
-      if (REDACT_H.has(k.toLowerCase()) || SECRET_NAME_RE.test(k)) {
+      if (REDACT_H.has(k.toLowerCase()) || secretName(k)) {
         const named = secretsIn(v)
         const first = v.split(' ')[0]
         const scheme = v.includes(' ') && first.length < 12 ? `${first} ` : ''
@@ -241,10 +313,23 @@
     if (o && typeof o === 'object') {
       const out = {}
       for (const [k, v] of Object.entries(o))
-        out[k] = REDACT_B.has(k.toLowerCase()) || SECRET_NAME_RE.test(k) ? '<redacted>' : redactObj(v, depth + 1)
+        out[k] = REDACT_B.has(k.toLowerCase()) || secretName(k) ? '<redacted>' : redactObj(v, depth + 1)
       return out
     }
     return o
+  }
+  // JSON that could not be parsed (truncated): every "name": "value" pair with a credential name
+  // loses its value, the pair cut by the truncation too (same as recorder.redact_json_text).
+  function redactJsonText(text) {
+    const pair = (m, name) => (REDACT_B.has(name.toLowerCase()) || secretName(name) ? `"${name}": "<redacted>"` : m)
+    text = text.replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.)*"/g, pair).replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.?)*$/g, pair)
+    if (text.includes('<')) {
+      const el = (m, full, local, attrs) => (REDACT_B.has(local.toLowerCase()) || secretName(local) ? `<${full}${attrs || ''}><redacted></${full}>` : m)
+      text = text.replace(/<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^>]*)?>([^<]{1,4000})<\/\1\s*>/g, el)
+      text = text.replace(/<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^>]*)?>([^<]{1,4000})(<\/[^>]*)?$/g, (m, full, local, attrs) =>
+        REDACT_B.has(local.toLowerCase()) || secretName(local) ? `<${full}${attrs || ''}><redacted>` : m)
+    }
+    return text
   }
   function body(raw, limit) {
     if (raw == null) return null
@@ -263,18 +348,12 @@
         return { _json: redactObj(JSON.parse(text)), ...(size > limit ? { _bytes: size, _truncated_after: limit } : {}) }
       } catch {}
     }
-    return size > limit ? { _text: text.slice(0, limit), _bytes: size, _truncated: true } : { _text: text }
+    return size > limit ? { _text: redactJsonText(text.slice(0, limit)), _bytes: size, _truncated: true } : { _text: redactJsonText(text) }
   }
   function kindOf(method, host, p, rawBody) {
     for (const r of cfg.rules || []) if (glob(r.host || '*', host) && re(r.path_regex || '').test(p)) return r.kind
-    if (typeof rawBody === 'string' && rawBody.slice(0, 200).includes('"query"')) {
-      try {
-        const q = JSON.parse(rawBody).query || ''
-        const m = /^\s*(mutation|query|subscription)\b/i.exec(q)
-        if (m) return m[1].toLowerCase() === 'mutation' ? 'write' : 'read'
-        if (q.trimStart().startsWith('{')) return 'read'
-      } catch {}
-    }
+    const g = gqlKind(rawBody)
+    if (g) return g
     if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return 'read'
     if (method === 'POST' && READ_RE.test(p)) return 'read'
     return 'write'
@@ -292,24 +371,154 @@
   if (RUN === 'always')
     RUN = process.env.CLAUDE_CODE_SESSION_ID ? `session-${process.env.CLAUDE_CODE_SESSION_ID.slice(0, 8)}` : null
   RUN = RUN || crypto.randomBytes(4).toString('hex')
-  function why() {
-    if (process.env.DOCKET_WHY) return process.env.DOCKET_WHY
+  function sessionState() {
     try {
       const d = JSON.parse(fs.readFileSync(path.join(DIR, '.state', 'why', `${SESSION}.json`), 'utf8'))
-      if (Date.now() - Date.parse(d.at) > 12 * 3600 * 1000) return ''
-      return d.why || ''
+      if (Date.now() - Date.parse(d.at) > 12 * 3600 * 1000) return {}
+      return d
     } catch {
-      return ''
+      return {}
     }
   }
-  const ARGV = scrubValues(process.argv.join(' ')).slice(0, 2000)
+  function why() {
+    if (process.env.DOCKET_WHY) return scrubProse(process.env.DOCKET_WHY)
+    return sessionState().why || ''
+  }
+  // Who is driving this process (same rules as store.agent_context).
+  function agentContext() {
+    const e = process.env
+    const name = e.CLAUDECODE || e.CLAUDE_CODE_SESSION_ID ? 'claude-code' : e.CODEX_SANDBOX || e.CODEX_THREAD_ID ? 'codex'
+      : e.CURSOR_AGENT ? 'cursor' : e.GEMINI_CLI ? 'gemini-cli' : e.COPILOT_AGENT || e.GITHUB_COPILOT_CLI ? 'copilot' : e.DOCKET_AGENT || null
+    const out = { name, session: e.CLAUDE_CODE_SESSION_ID || e.CODEX_THREAD_ID || e.DOCKET_SESSION || null,
+      model: e.DOCKET_MODEL || e.ANTHROPIC_MODEL || e.CLAUDE_MODEL || null, user: null, machine: null, started_in: null }
+    try { out.user = os.userInfo().username } catch {}
+    try { out.machine = os.hostname() } catch {}
+    const hook = sessionState().agent || {}
+    for (const k of ['name', 'session', 'model', 'started_in']) if (hook[k] && !out[k]) out[k] = hook[k]
+    if (hook.model) out.model = hook.model
+    return out
+  }
+  const AGENT = agentContext()
+  const ARGV = scrubValues(scrubArgvList(process.argv)).slice(0, 2000)
 
+  function graphqlKind(q, operationName) {
+    if (typeof q !== 'string') return null
+    const ops = [...q.matchAll(/(?:^|[}\s])(mutation|query|subscription)\b\s*([A-Za-z_][A-Za-z0-9_]*)?\s*(?=[({@])/gi)].map((m) => [m[1].toLowerCase(), m[2]])
+    if (operationName) {
+      for (const [kind, name] of ops) if (name === operationName) return kind === 'mutation' ? 'write' : 'read'
+      return ops.length ? 'write' : null
+    }
+    if (ops.length) return ops.some(([k]) => k === 'mutation') ? 'write' : 'read'
+    return q.trimStart().startsWith('{') ? 'read' : null
+  }
+  function gqlKind(rawBody) {
+    if (typeof rawBody !== 'string' || !rawBody.slice(0, 200).includes('"query"')) return null
+    try {
+      const doc = JSON.parse(rawBody)
+      return graphqlKind(doc.query || '', doc.operationName)
+    } catch {}
+    return null
+  }
+  // ---- policy (twin of policy.py): the nearest .docket-policy.json over config.policy --------
+  function loadPolicy() {
+    let pol = { ...(cfg.policy || {}) }
+    let d = CWD
+    const home = os.homedir()
+    for (;;) {
+      const f = path.join(d, '.docket-policy.json')
+      try {
+        if (fs.statSync(f).isFile()) {
+          const local = JSON.parse(fs.readFileSync(f, 'utf8'))
+          pol = { ...pol, ...local, rules: [...(pol.rules || []), ...(local.rules || [])], budgets: [...(pol.budgets || []), ...(local.budgets || [])] }
+          break
+        }
+      } catch {}
+      if (d === home) break
+      const up = path.dirname(d)
+      if (up === d) break
+      d = up
+    }
+    return pol
+  }
+  function countWrites(hostPat, per, key) {
+    let n = 0
+    const days = [0, 1].map((k) => { const t = new Date(Date.now() - k * 86400000); return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}` })
+    for (const day of days) {
+      let lines = []
+      try { lines = fs.readFileSync(path.join(DIR, 'calls', `${day}.jsonl`), 'utf8').split('\n') } catch { continue }
+      for (const ln of lines) {
+        if (!ln) continue
+        let r
+        try { r = JSON.parse(ln) } catch { continue }
+        if (r.kind !== 'write' || r.status === 'BLOCKED' || !glob(hostPat, r.host || '')) continue
+        if (per === 'run') { if (r.run === key) n++ }
+        else {
+          const sess = (r.agent && r.agent.session) || (String(r.run || '').startsWith('session-') ? r.run : null)
+          if (sess && key && (sess === key || String(r.run || '') === `session-${key.slice(0, 8)}`)) n++
+          else if (!sess && key === 'default') n++
+        }
+      }
+    }
+    return n
+  }
+  const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch {} }
+  function requestApproval(rule, host, method, p) {
+    const dir = path.join(DIR, '.state', 'approvals')
+    fs.mkdirSync(dir, { recursive: true })
+    const id = crypto.randomBytes(4).toString('hex')
+    const f = path.join(dir, `${id}.json`)
+    const req = { id, host, method, path: p, project: PROJECT.name, why: why(), agent: AGENT, asked: Date.now() / 1000, state: 'pending' }
+    fs.writeFileSync(f, JSON.stringify(req))
+    const timeout = Number(rule.timeout || 600)
+    try { process.stderr.write(`[docket] ${method} ${host}${p} from ${PROJECT.name || '?'} (${why() || 'no reason'}) waits for approval: docket approve ${id}   (deny: docket deny ${id}; ${timeout}s)\n`) } catch {}
+    const deadline = Date.now() + timeout * 1000
+    while (Date.now() < deadline) {
+      let st = 'pending'
+      try { st = JSON.parse(fs.readFileSync(f, 'utf8')).state } catch {}
+      if (st === 'approved') return null
+      if (st === 'denied') return `docket: ${method} ${host}${p} denied by a person (approval ${id})`
+      sleepSync(1000)
+    }
+    try { fs.writeFileSync(f, JSON.stringify({ ...req, state: 'expired' })) } catch {}
+    return `docket: ${method} ${host}${p} not approved within ${timeout}s (approval ${id})`
+  }
+  function policyVerdict(host, method, p, kind) {
+    const pol = loadPolicy()
+    if (!pol || (!(pol.rules || []).length && !(pol.budgets || []).length)) return null
+    const reason = why()
+    for (const r of pol.rules || []) {
+      if (!glob((r.host || '*').toLowerCase(), (host || '').toLowerCase())) continue
+      if (r.methods && !r.methods.map((m) => m.toUpperCase()).includes(method.toUpperCase())) continue
+      if (r.project && !glob(r.project, PROJECT.name || '')) continue
+      const rk = r.kind || 'write'
+      if (rk !== 'any' && rk !== kind) continue
+      if (r.deny) {
+        if (r.unless_why && reason) continue
+        return `docket policy: ${method} ${host} is refused${r.unless_why ? ' without a reason (docket why "...")' : ''}${r.note ? ` (${r.note})` : ''}`
+      }
+      if (r.approve) return requestApproval(r, host, method, p)
+      if (r.allow) return null
+    }
+    if (kind === 'write') {
+      for (const b of pol.budgets || []) {
+        if (!glob((b.host || '*').toLowerCase(), (host || '').toLowerCase())) continue
+        if (b.project && !glob(b.project, PROJECT.name || '')) continue
+        const per = b.per || 'session'
+        const key = per === 'run' ? RUN : AGENT.session || 'default'
+        const n = countWrites(b.host || '*', per, key)
+        if (n >= Number(b.writes || 0)) return `docket budget: ${n} writes to ${b.host || 'any host'} already this ${per} (limit ${b.writes})`
+      }
+    }
+    return null
+  }
   function gate(method, host, p, rawBody) {
+    // A dry run blocks by METHOD (read_path_regex is a label, not a safety rule; see recorder.gate).
+    if (process.env.DOCKET_DRY === '1' && !['GET', 'HEAD', 'OPTIONS'].includes(method) && gqlKind(rawBody) !== 'read')
+      return 'docket dry run: write not sent'
     if (kindOf(method, host, p, rawBody) !== 'write' || AUTH_RE.test(p)) return null
-    if (process.env.DOCKET_DRY === '1') return 'docket dry run: write not sent'
     if (!why() && (cfg.require_why_hosts || []).some((g) => glob(g, host)))
       return `docket: writes to ${host} need a reason (docket run --why, or docket why "...")`
-    return null
+    try { return policyVerdict(host, method, p, 'write') } catch (e) { warn(e); return null }
   }
 
   function record(r) {
@@ -331,11 +540,12 @@
       const id = `${ts.slice(0, 10).replace(/-/g, '')}-${ts.slice(11, 19).replace(/:/g, '')}-${crypto.randomBytes(3).toString('hex')}`
       const reason = why()
       const query = r.query
-        ? Object.fromEntries(Object.entries(r.query).map(([k, v]) => [k, re(cfg.scrub_regex).test(`${k}=x`) ? '<redacted>' : v]))
+        ? Object.fromEntries(Object.entries(r.query).map(([k, v]) => [k, re(cfg.scrub_regex).test(`${k}=x`) || secretName(k) ? '<redacted>' : v]))
         : null
       const out = {
         id, ts, run: RUN, why: reason, kind,
         project: PROJECT.name, folder: PROJECT.folder, branch: PROJECT.branch,
+        agent: AGENT, via: 'script',
         service: serviceOf(host), secrets: used.length ? used : null,
         transport: 'http', method: r.method, host, path: r.path, query,
         request: { headers: redactHeaders(r.headers), body: body(reqBody, w ? cfg.write_request_max : cfg.read_request_max) },
@@ -423,6 +633,10 @@
   }
 
   // ---- http / https (axios, got, the Stripe and AWS SDKs) ------------------------------------
+  const PENDING = new Set()
+  process.once('exit', () => {
+    for (const end of [...PENDING]) try { end() } catch {}
+  })
   for (const modName of ['http', 'https']) {
     try {
       const mod = require(`node:${modName}`)
@@ -452,7 +666,7 @@
         const no = gate(method, host, p, null)
         if (no) {
           record({ method, host, path: p, query, headers, status: 'BLOCKED', error: no, ms: 0 })
-          const req = origRequest.call(this, 'http://127.0.0.1:9/')
+          const req = origRequest.call(this, { hostname: '127.0.0.1', port: 9, path: '/' })
           req.destroy(new Error(no))
           return req
         }
@@ -480,13 +694,45 @@
             return oe.call(this, chunk, ...rest)
           }
           let done = false
-          const finish = (status, error) => {
+          const finish = (status, error, respBody) => {
             if (done) return
             done = true
             const b = chunks.length ? Buffer.concat(chunks).toString('utf8') : null
-            record({ method, host, path: p, query, headers: { ...headers, ...(req.getHeaders ? req.getHeaders() : {}) }, reqBody: b, status, error, ms: Date.now() - t0 })
+            record({ method, host, path: p, query, headers: { ...headers, ...(req.getHeaders ? req.getHeaders() : {}) }, reqBody: b, status, error, respBody, ms: Date.now() - t0 })
           }
-          req.once('response', (res) => finish(res.statusCode, null))
+          req.once('response', (res) => {
+            // Copy the body as the stream delivers it through push(): nothing is consumed and the
+            // stream's mode is untouched, so the caller reads it exactly as before. Text types only.
+            const ct = String(res.headers['content-type'] || '')
+            if (!/json|text|xml|x-www-form/i.test(ct) || /event-stream/i.test(ct)) return finish(res.statusCode, null, null)
+            const parts = []
+            let got = 0
+            const limit = Math.max(cfg.write_response_max, cfg.read_response_max)
+            const op = res.push
+            res.push = function (chunk, ...rest) {
+              try {
+                if (chunk && got < limit) {
+                  const b = Buffer.from(chunk)
+                  parts.push(b)
+                  got += b.length
+                }
+              } catch {}
+              return op.call(this, chunk, ...rest)
+            }
+            const end = () => {
+              PENDING.delete(end)
+              finish(res.statusCode, null, parts.length ? Buffer.concat(parts).toString('utf8') : null)
+            }
+            res.once('end', end)
+            res.once('close', end)
+            res.once('error', end)
+            // A caller that never reads the body (fire-and-forget) never ends the stream: record
+            // the call without a body once it is clear nobody is consuming it, or at exit.
+            PENDING.add(end)
+            setImmediate(() => {
+              if (res.readableFlowing === null && res.listenerCount('readable') === 0 && res.listenerCount('data') === 0) end()
+            })
+          })
           req.once('error', (e) => finish(null, String(e && e.message).slice(0, 500)))
         } catch (e) {
           warn(e)

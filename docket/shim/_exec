@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Shim for binaries no in-process hook can see (ssh, aws, gh, terraform, kubectl, git push ...).
+Symlinked under each name in this folder by `docket setup` / `docket run`. Records the command
+as one call (transport "exec": the tool, its subcommand, the target host or profile, the exit
+code; argv scrubbed) and runs the real binary with the same stdin, stdout, stderr and tty, so
+interactive ssh and prompts work unchanged. A failure in here never stops the command."""
+import os, sys, subprocess, time, re
+_pkg = os.environ.get("DOCKET_PKG")
+if _pkg and _pkg not in sys.path:
+    sys.path.insert(0, _pkg)
+
+NAME = os.path.basename(sys.argv[0])
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+# What is provably a READ. Everything else is a write: for a change log, and for `--dry`, a
+# wrong "read" is the dangerous mistake, so these are tight. `aws logs delete-log-group` is not
+# a read because the service is "logs"; the OPERATION decides (describe-/get-/list-).
+READ_OPS = {
+    "aws": lambda w: len(w) >= 2 and (w[1].startswith(("describe-", "get-", "list-", "filter-", "tail", "lookup-", "search-", "query"))
+                                      or w[1] in ("ls", "help", "wait") or w[0] in ("sts", "help")),
+    "gh": lambda w, a: (w[:1] == ["api"] and not _has_opt(a, "-X", "--method", "-F", "-f", "--field", "--raw-field", "--input"))
+                       or (len(w) >= 2 and w[1] in ("view", "list", "status", "checks", "diff", "watch")) or w[:1] in (["status"], ["search"], ["browse"])
+                       or w[:2] == ["auth", "status"],
+    "wrangler": lambda w: tuple(w[:1]) in WRANGLER_READS or tuple(w[:2]) in WRANGLER_READS or tuple(w[:3]) in WRANGLER_READS,
+    "terraform": lambda w: w[:1] in (["plan"], ["show"], ["output"], ["validate"], ["fmt"], ["providers"], ["graph"], ["version"], ["console"])
+                           or w[:2] in (["state", "list"], ["state", "show"]),
+    "kubectl": lambda w: w[:1] in (["get"], ["describe"], ["logs"], ["top"], ["explain"], ["version"], ["cluster-info"], ["diff"], ["wait"])
+                         or w[:2] in (["config", "view"], ["config", "current-context"], ["auth", "can-i"]),
+    "helm": lambda w: w[:1] in (["list"], ["ls"], ["status"], ["get"], ["show"], ["search"], ["history"], ["version"], ["template"], ["lint"], ["env"]),
+    # Multi-level CLIs (gcloud compute instances list): a read needs the read verb LAST and every
+    # word before it in the group-noun list below. `gcloud compute instances suspend list` has
+    # "suspend", not a noun: a write. An unknown group is a write too; extend NOUNS, not the rule.
+    "gcloud": lambda w: _nouns_then(w, ("list", "describe", "help"), ("get-", "print-", "read")),
+    "az": lambda w: _nouns_then(w, ("list", "show", "help"), ("get-",)),
+    "flyctl": lambda w: w[:1] in (["status"], ["logs"], ["list"], ["ls"], ["info"], ["version"], ["releases"], ["help"]) or w[:2] in (["config", "show"], ["auth", "whoami"], ["machines", "list"], ["apps", "list"]),
+    "vercel": lambda w: w[:1] in (["ls"], ["list"], ["inspect"], ["logs"], ["whoami"], ["help"]) or w[:2] in (["env", "ls"], ["domains", "ls"], ["projects", "ls"]),
+    "netlify": lambda w: w[:1] in (["status"], ["sites:list"], ["env:list"], ["help"]),
+    "heroku": lambda w: w[:1] in (["apps"], ["logs"], ["ps"], ["config"], ["releases"], ["info"], ["whoami"], ["help"]) and not any(x.startswith("--") and x not in ("--app", "-a") for x in w),
+    "doctl": lambda w: _nouns_then(w, ("list", "get", "ls", "help", "version"), ()),
+    "stripe": lambda w: w[:1] in (["listen"], ["logs"], ["status"], ["version"], ["help"], ["open"], ["resources"], ["get"]) or (len(w) >= 2 and w[1] == "list"),
+}
+READ_OPS["fly"] = READ_OPS["flyctl"]
+# wrangler: the exact read sequences, so a database or namespace NAMED "list" changes nothing
+# (`wrangler d1 execute list --command='DROP TABLE'` is a write).
+WRANGLER_READS = {("whoami",), ("tail",), ("deployments", "list"), ("deployments", "status"), ("versions", "list"), ("versions", "view"),
+                  ("kv", "namespace", "list"), ("kv", "key", "list"), ("kv", "key", "get"), ("kv:namespace", "list"), ("kv:key", "list"),
+                  ("kv:key", "get"), ("d1", "list"), ("d1", "info"), ("d1", "migrations", "list"), ("secret", "list"), ("r2", "bucket", "list"),
+                  ("r2", "object", "get"), ("queues", "list"), ("pages", "project", "list"), ("pages", "deployment", "list"),
+                  ("workflows", "list"), ("workflows", "describe"), ("vectorize", "list"), ("hyperdrive", "list"), ("types",), ("docs",)}
+NOUNS = {  # command groups and resource types of gcloud, az and doctl that a read may pass through
+    "compute", "instances", "disks", "images", "snapshots", "zones", "regions", "networks", "subnets", "firewall-rules",
+    "addresses", "routes", "routers", "instance-groups", "instance-templates", "machine-types", "operations", "projects",
+    "services", "sql", "databases", "storage", "buckets", "objects", "iam", "service-accounts", "roles", "policies", "keys",
+    "container", "clusters", "node-pools", "functions", "secrets", "versions", "config", "configurations", "auth", "accounts",
+    "logging", "logs", "sinks", "monitoring", "pubsub", "topics", "subscriptions", "dns", "managed-zones", "record-sets",
+    "domains", "artifacts", "repositories", "docker", "builds", "triggers", "scheduler", "jobs", "tasks", "queues", "redis",
+    "memcache", "spanner", "bigtable", "bigquery", "datasets", "tables", "dataflow", "dataproc", "ai", "models", "endpoints",
+    "app", "apps", "regions", "vm", "vmss", "group", "groups", "resource", "resources", "webapp", "functionapp", "aks", "acr",
+    "network", "vnet", "nsg", "lb", "public-ip", "nic", "disk", "image", "keyvault", "secret", "key", "certificate", "sql",
+    "server", "db", "cosmosdb", "monitor", "metrics", "activity-log", "role", "assignment", "definition", "ad", "user", "sp",
+    "identity", "deployment", "policy", "lock", "tag", "tags", "account", "subscription", "location", "provider", "feature",
+    "droplet", "droplets", "kubernetes", "cluster", "registry", "database", "db", "load-balancer", "firewall", "vpc", "vpcs",
+    "ssh-key", "ssh-keys", "image", "images", "snapshot", "size", "sizes", "region", "domain", "records", "record", "monitoring",
+    "alert", "uptime", "billing", "invoice", "balance", "history", "spaces", "serverless", "cdn", "certificate", "project",
+    "action", "actions", "1-click", "volume", "volumes", "tags", "tag", "reserved-ip", "reserved-ips", "backups", "pools",
+    "replica", "replicas", "connection", "options", "maintenance", "engines", "firewalls", "sql-mode", "topics",
+    "beta", "alpha", "preview", "experimental"}
+
+
+def _nouns_then(w, read_last, read_prefixes):
+    if not w:
+        return False
+    last = w[-1]
+    if not (last in read_last or last.startswith(read_prefixes)):
+        return False
+    return all(x in NOUNS for x in w[:-1])
+# Any of these among the operation words makes the command a write, whatever else matches:
+# `gcloud compute instances delete list` names an instance "list"; the delete still counts.
+WRITE_VERBS = {"delete", "destroy", "remove", "rm", "create", "add", "update", "set", "apply", "deploy", "run", "exec", "start",
+               "stop", "restart", "reboot", "resize", "move", "import", "rollback", "scale", "patch", "replace", "attach", "detach",
+               "enable", "disable", "upgrade", "reset", "push", "put", "write", "edit", "install", "uninstall", "purge", "kill",
+               "terminate", "modify", "rotate", "revoke", "grant", "promote", "release", "publish", "send", "invoke", "trigger",
+               "cancel", "approve", "merge", "close", "reopen", "rename", "copy", "cp", "mv", "sync", "upload", "transfer", "migrate",
+               # verbs that EXECUTE something, whatever the last word is: `gcloud compute ssh list --command=...`
+               "ssh", "scp", "connect", "tunnel", "proxy", "forward", "login", "logout", "shell", "console", "submit", "call",
+               "exec-", "port", "serial", "rdp", "session", "sessions", "command", "commands", "script", "scripts", "job", "jobs",
+               "ssm", "batch", "lambda", "functions", "function", "workflows", "workflow", "pipeline", "pipelines", "build", "builds",
+               "execute", "query", "sql", "dev"}   # wrangler d1 execute / dev --remote
+# ^ aws ssm/lambda/batch: their reads are describe-/get-/list- operations, which READ_OPS["aws"]
+#   matches on the operation word; the WRITE_VERBS check above runs first, so for aws the nouns
+#   are skipped (see describe()).
+# ssh: ONE read-only command, checked on the whole remote command line. Each token must be a
+# plain word (no shell operators, quotes, newlines or substitutions anywhere), and each command
+# has its own rule for which tokens may follow it: `hostname newname` sets the name and
+# `journalctl --vacuum-time=1s` deletes logs, so neither is a read.
+_TOKEN = re.compile(r"^[A-Za-z0-9_./=:,*@+%-]+$")
+_SSH_READ_CMDS = {
+    # command -> allowed argument tokens (None = no arguments at all)
+    "hostname": None, "uptime": None, "id": None, "whoami": None,
+    "top": re.compile(r"^(-b|-n|-bn\d*|\d+)$"),
+    "cat": _TOKEN, "ls": _TOKEN, "tail": _TOKEN, "head": _TOKEN, "grep": _TOKEN, "df": _TOKEN, "free": _TOKEN, "ps": _TOKEN,
+    "journalctl": re.compile(r"^(-u|-n|-f|-p|-o|-b|-k|-r|-x|-e|-q|--no-pager|--since(=.*)?|--until(=.*)?|--lines(=\d+)?|[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*)$"),   # no other --option
+    "systemctl status": _TOKEN, "docker ps": _TOKEN, "docker logs": _TOKEN, "docker images": _TOKEN,
+    "kubectl get": _TOKEN, "kubectl logs": _TOKEN,
+}
+
+
+def ssh_is_read(cmd):
+    if not cmd or not all(_TOKEN.match(t) for t in cmd.split(" ")):
+        return False
+    toks = cmd.split(" ")
+    for name, rule in _SSH_READ_CMDS.items():
+        n = len(name.split(" "))
+        if toks[:n] == name.split(" "):
+            rest = toks[n:]
+            if rule is None:
+                return not rest
+            if name == "journalctl" and any(t.startswith(("--vacuum", "--rotate", "--flush", "--sync", "--relinquish", "--setup-keys", "--update-catalog")) for t in rest):
+                return False
+            return all(rule.match(t) for t in rest)
+    return False
+
+
+def _has_opt(args, *opts):
+    """Is one of these options present in any spelling: `-X DELETE`, `-XDELETE`, `--method DELETE`,
+    `--method=DELETE`? Decides whether a `gh api` call is read-only, so every form counts."""
+    for x in args:
+        for o in opts:
+            if x == o or x.startswith(o + "="):
+                return True
+            if not o.startswith("--") and x.startswith(o) and len(x) > len(o):   # -XDELETE, -fkey=v
+                return True
+    return False
+# git: only what reaches a remote is recorded (everything else is local and in git's own log).
+GIT_RECORD = re.compile(r"^(push|remote (add|remove|rm|set-url|rename)|lfs push|send-email|svn dcommit)\b")
+GIT_LOCAL = {"add", "am", "apply", "archive", "bisect", "blame", "branch", "bundle", "cat-file", "check-ignore", "checkout",
+             "cherry-pick", "clean", "clone", "commit", "config", "count-objects", "describe", "diff", "difftool", "fetch",
+             "for-each-ref", "format-patch", "fsck", "gc", "grep", "hash-object", "help", "init", "log", "ls-files", "ls-remote",
+             "ls-tree", "maintenance", "merge", "merge-base", "mergetool", "mv", "name-rev", "notes", "pull", "range-diff",
+             "rebase", "reflog", "remote", "repack", "replace", "reset", "restore", "rev-list", "rev-parse", "revert", "rm",
+             "shortlog", "show", "show-ref", "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref", "tag",
+             "update-index", "update-ref", "version", "--version", "whatchanged", "worktree", "lfs"}   # not flow/svn: they can push
+
+
+def _git_expand(args, words):
+    """The words with a leading alias replaced by what it stands for, repeatedly (git resolves
+    `publish -> ship -> push` the same way), with cycle detection: `-c alias.NAME=...` on the
+    command line first, then `git config --get alias.NAME`. Returns (words, known): known only
+    when the FINAL command is a local one or a recorded remote one; a shell alias (`!...`), an
+    unknown name or a loop is not known."""
+    inline = {}
+    for i, a in enumerate(args[:-1]):
+        if a == "-c" and args[i + 1].startswith("alias."):
+            k, _, v = args[i + 1][6:].partition("="); inline[k] = v
+    # git's global options (-C dir, --git-dir=, --work-tree, -c k=v ...) come before the
+    # subcommand and decide WHICH repository's config answers; the lookup carries them all.
+    globals_, i = [], 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix") and i + 1 < len(args):
+            globals_ += args[i:i + 2]; i += 2
+        else:
+            globals_.append(args[i]); i += 1
+    seen = set()
+    for _ in range(10):
+        if not words:
+            return words, False
+        name = words[0]
+        if name in GIT_LOCAL or GIT_RECORD.match(" ".join(words)):
+            return words, True
+        if name in seen:
+            return words, False
+        seen.add(name)
+        target = inline.get(name)
+        if target is None:
+            try:
+                real = [c for c in (os.path.join(p, "git") for p in os.environ.get("PATH", "").split(os.pathsep))
+                        if os.path.isfile(c) and os.path.realpath(c) != os.path.realpath(__file__)]
+                r = subprocess.run([real[0] if real else "git", *globals_, "config", "--get", f"alias.{name}"], capture_output=True, text=True, timeout=5)
+                target = r.stdout.strip() if r.returncode == 0 else None
+            except Exception:
+                target = None
+        if not target or target.startswith("!"):
+            return words, False
+        import shlex
+        words = shlex.split(target) + words[1:]
+    return words, False
+
+
+def real_binary():
+    meant = os.environ.get("DOCKET_REAL_BIN")   # `docket run -- /usr/local/bin/aws ...`: that one, not PATH's
+    if meant and os.path.basename(meant) == NAME and os.path.isfile(meant) and os.access(meant, os.X_OK) \
+            and os.path.realpath(meant) != os.path.realpath(__file__):
+        return meant
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if not p or os.path.realpath(p) == HERE:
+            continue
+        c = os.path.join(p, NAME)
+        if os.path.isfile(c) and os.access(c, os.X_OK) and os.path.realpath(c) != os.path.realpath(__file__):
+            return c
+    return None
+
+
+_SSH_VALUE_OPTS = set("-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w -B -P".split())
+
+
+# ssh options a READ may carry. Anything else (-o LocalCommand=..., ProxyCommand, -F config,
+# -O, -W, -L/-R/-D forwards, -J jumps ...) can run or change something on its own: a write.
+_SSH_SAFE_OPTS = {"-p", "-i", "-l", "-q", "-T", "-n", "-4", "-6", "-v", "-vv", "-vvv", "-C", "-a", "-x", "-k"}
+_SSH_SAFE_O = re.compile(r"(?i)^(StrictHostKeyChecking|UserKnownHostsFile|ConnectTimeout|ConnectionAttempts|BatchMode|IdentitiesOnly|"
+                         r"LogLevel|ServerAlive\w+|Port|User|IdentityFile|PasswordAuthentication|PubkeyAuthentication|"
+                         r"PreferredAuthentications|HostKeyAlgorithms|KexAlgorithms|Ciphers|MACs|AddKeysToAgent|ForwardAgent=no|"
+                         r"RequestTTY|TCPKeepAlive|Compression|HashKnownHosts|CheckHostIP|VerifyHostKeyDNS|HostName|Hostname)(=|$)")
+
+
+def _ssh_split(args):
+    """(destination, remote command verbatim, options are all safe). ssh's own options come
+    first; the first positional is the destination; EVERYTHING after it, flags included, is the
+    remote command."""
+    i, safe = 0, True
+    while i < len(args):
+        a = args[i]
+        if a in _SSH_VALUE_OPTS:
+            val = args[i + 1] if i + 1 < len(args) else ""
+            if a not in _SSH_SAFE_OPTS and not (a == "-o" and _SSH_SAFE_O.match(val)):
+                safe = False
+            i += 2; continue
+        if a.startswith("-") and len(a) > 1:
+            if a not in _SSH_SAFE_OPTS and not (a.startswith("-o") and _SSH_SAFE_O.match(a[2:])):
+                safe = False
+            i += 1; continue
+        return a, " ".join(args[i + 1:]), safe
+    return None, "", safe
+
+
+def _write_verb(ops):
+    """Any operation word (or hyphen part of one) that executes or changes something. For aws,
+    the first word is a service noun (ssm, lambda, batch) and the second the operation
+    (describe-instance-information): only the operation is checked."""
+    check = ops[1:2] if NAME == "aws" else ops
+    words = {w for op in check for w in op.split("-")}
+    if NAME == "aws":   # describe-instance-information, list-functions, get-command-invocation: the verb is first
+        return bool(words & WRITE_VERBS) and not (check and check[0].startswith(("describe-", "get-", "list-")))
+    return bool(words & WRITE_VERBS)
+
+
+def _scrub_command_text(text):
+    """A remote command is one shell string: split it the way the remote shell will, redact
+    every secret-named flag's whole value, and rejoin. A string shlex cannot parse (an open
+    quote) is not recorded at all rather than half-redacted."""
+    if not text:
+        return text
+    try:
+        import shlex
+        from docket.recorder import scrub_argv_list
+        return scrub_argv_list(shlex.split(text), quote=False)[:200]
+    except Exception:
+        return "<command text omitted: could not parse it for redaction>"
+
+
+def _read(rule, words, args):
+    try:
+        return rule(words, args)
+    except TypeError:
+        return rule(words)
+
+
+def describe(argv):
+    """(host, subcommand, kind) for the record. host is what the call reaches: the ssh host,
+    the AWS profile or region, the gh/kubectl/wrangler target, else the tool's own name."""
+    args = [a for a in argv if a]
+    flags_with_value = {"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-E", "-S", "-b", "-c", "-e", "-m", "-P",
+                        "--profile", "--region", "--context", "--namespace", "-n", "--kubeconfig", "--project", "--account",
+                        "--subscription", "--env", "--app", "-a", "--repo", "-R", "--hostname", "--config", "--scope",
+                        "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}   # git's global options
+    words, ops, host, i = [], [], None, 0
+    opts, seen_opt = {}, False
+    while i < len(args):
+        a = args[i]
+        if a in flags_with_value and i + 1 < len(args):   # a known option and its value: both skipped
+            opts[a] = args[i + 1]; i += 2; continue
+        if a.startswith("--") and "=" in a:                 # --name=value: self-contained
+            k, v = a.split("=", 1); opts[k] = v; i += 1; continue
+        if a.startswith("-") and len(a) > 1:
+            # An option this parser does not know: what follows may be its value, so from here on
+            # nothing more counts as an operation word (`--name list` must never read as `list`).
+            i += 1; seen_opt = True; continue
+        words.append(a)
+        if not seen_opt:
+            ops.append(a)   # the operation: `aws --profile prod s3 ls` -> s3 ls; `az group delete` -> group delete
+        i += 1
+    sub = " ".join(words[:2]) if NAME not in ("ssh", "scp", "sftp", "rsync") else ""
+    remote_cmd = None   # ssh: the WHOLE remote command is classified; only the record is shortened
+    ssh_safe = True
+    if NAME in ("ssh", "sftp"):
+        host, remote_cmd, ssh_safe = _ssh_split(args)
+        sub = remote_cmd[:200]
+    elif NAME in ("scp", "rsync"):
+        remote = [w for w in words if ":" in w and not w.startswith("/")]
+        host = remote[0].split(":", 1)[0] if remote else None
+        sub = " ".join(words)[:200]
+    elif NAME == "aws":
+        host = opts.get("--profile") or os.environ.get("AWS_PROFILE") or "aws"
+        if opts.get("--region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+            host += "." + (opts.get("--region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+    elif NAME == "kubectl":
+        host = opts.get("--context") or os.environ.get("KUBECONFIG", "").split("/")[-1] or "kubectl"
+    elif NAME == "gh":
+        host = opts.get("--hostname") or opts.get("-R") or opts.get("--repo") or "github.com"
+    elif NAME == "git":
+        gw, _ = _git_expand(args, words)
+        host = (gw[1] if len(gw) > 1 and gw[0] == "push" and not gw[1].startswith("-") else "git")
+    else:
+        host = opts.get("--project") or opts.get("--app") or opts.get("-a") or opts.get("--env") or NAME
+    if host and "@" in host:
+        host = host.split("@", 1)[1]
+    host = re.sub(r"[^A-Za-z0-9._:\-\[\]%]", "-", host or NAME)[:253].strip(".-") or NAME
+    joined = " ".join(words)
+    if NAME == "git":
+        gw, known = _git_expand(args, words)
+        if GIT_RECORD.match(" ".join(gw)):
+            kind = "write"
+        elif known:
+            kind = None                                          # local: not recorded at all
+        else:
+            kind = "write" if os.environ.get("DOCKET_DRY") == "1" else None   # unknown: refused under --dry
+    elif NAME in ("ssh", "sftp"):
+        kind = "read" if ssh_safe and ssh_is_read(remote_cmd) else "write"   # no command = an interactive shell
+    elif NAME in ("scp", "rsync"):
+        kind = "write"
+    elif NAME in READ_OPS and not _write_verb(ops) and _read(READ_OPS[NAME], ops, args):
+        # `add-metadata`, `set-iam-policy`, `delete-log-group`: a write verb inside a hyphenated operation counts
+        kind = "read"
+    else:
+        kind = "write"
+    return host, sub or " ".join(words[:2]), kind
+
+
+def run_forwarding_signals(cmd, **popen):
+    """Run the real binary; a signal sent to this wrapper reaches the child (a supervisor or
+    Popen.terminate() that stops the wrapper must stop the ssh/terraform underneath)."""
+    import signal
+    proc = subprocess.Popen(cmd, **popen)
+    def forward(sig, frame):
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+    # SIGINT too: one aimed at this PID (Popen.send_signal) must reach the child; a terminal
+    # Ctrl-C reaches both through the process group, and a second SIGINT is harmless there.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            signal.signal(sig, forward)
+        except Exception:
+            pass
+    return proc
+
+
+def main():
+    argv = sys.argv[1:]
+    real = real_binary()
+    if not real:
+        sys.stderr.write(f"{NAME}: command not found\n"); sys.exit(127)
+    rec = None; host = sub = None; kind = None; why_not = None
+    try:
+        from docket.recorder import Recorder, scrub_argv_list
+        from docket import store
+        d = store.find_dir()
+        if d and os.environ.get("DOCKET_RUN"):
+            rec = Recorder(d)
+            host, sub, kind = describe(argv)
+            sub = rec.scrub_argv(_scrub_command_text(sub))   # `deploy --password "a b c"` goes into path and CHANGES.md
+            if kind:
+                # the explicit rule wins over the path heuristic for exec records
+                rec.cfg.setdefault("rules", []).insert(0, {"host": host, "path_regex": r".*", "kind": kind})
+                why_not = rec.gate("EXEC" if kind == "write" else "GET", host, "/" + sub, None, transport="exec")
+    except Exception as e:
+        sys.stderr.write(f"[docket] {NAME} shim: {e}\n")
+        if os.environ.get("DOCKET_DRY") == "1":   # a dry run fails closed: unclassified means not run
+            why_not = f"docket dry run: could not classify the command ({e})"
+    if why_not:
+        # Refused. Recording the refusal may fail (full disk, unwritable trail); the command
+        # still does not run.
+        try:
+            rec.blocked("exec", NAME.upper(), host, "/" + sub, None, {}, rec.scrub_argv(scrub_argv_list(argv))[:2000], why_not, via="exec")
+        except Exception as e:
+            sys.stderr.write(f"[docket] could not record the refusal: {e}\n")
+        sys.stderr.write(f"[docket] {why_not}: {NAME} {sub}\n")
+        sys.exit(7)
+    t0 = time.time()
+    code = run_forwarding_signals([real] + argv).wait()
+    if code < 0:   # killed by a signal: the shell-visible status is 128 + the signal, as for the binary itself
+        code = 128 - code
+    if rec is not None and kind:
+        try:
+            rec.record({"transport": "exec", "via": "exec", "method": NAME.upper(), "host": host, "path": "/" + sub, "query": None,
+                        "req_headers": {}, "req_body": rec.scrub_argv(scrub_argv_list(argv))[:4000], "status": code,
+                        "resp_body": None, "ms": int((time.time() - t0) * 1000),
+                        "error": None if code == 0 else f"{NAME} exit {code}"})
+        except Exception as e:
+            sys.stderr.write(f"[docket] {NAME} record failed: {e}\n")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()
