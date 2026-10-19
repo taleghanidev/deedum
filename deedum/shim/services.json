@@ -112,36 +112,12 @@
 "Resend"
 ],
 [
-"api.vendor-c.example",
-"Vendor C"
-],
-[
-"api.vendor-d.example",
-"Vendor D"
-],
-[
-"vendor-e.example",
-"Vendor E"
-],
-[
-"api.vendor-e.example",
-"Vendor E"
-],
-[
 "*.amazonaws.com",
 "AWS"
 ],
 [
 "api.telegram.org",
 "Telegram"
-],
-[
-"api.vendor-b.example",
-"Vendor B"
-],
-[
-"*.vendor-a.example",
-"Vendor A"
 ],
 [
 "console.neon.tech",

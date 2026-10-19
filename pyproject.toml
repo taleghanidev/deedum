@@ -9,7 +9,7 @@ description = "A git-friendly record of every API call a command makes: the payl
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "taleghanidev and the deedum contributors", email = ""}]
+authors = [{name = "deedum contributors"}]
 dependencies = []
 classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License",
                "Operating System :: MacOS", "Operating System :: POSIX :: Linux", "Topic :: System :: Logging"]
