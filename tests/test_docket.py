@@ -456,6 +456,9 @@ def test_prune_and_pinned_hook():
         blob = _re.sub(pat, "", blob)   # what git-filter-repo --replace-text does to every historical blob
     assert blob == "# API changes\n\n- 2026-03-05 10:00 · kept\n- 2026-03-06 10:00 · kept\n", blob
     env_out = cli(d, "env"); assert env_out.returncode == 0 and "ssh() {" in env_out.stdout and "curl() {" in env_out.stdout
+    from docket.cli import BIN_DIR, shim_wrapper
+    w = (pathlib.Path(BIN_DIR) / "aws").read_text()
+    assert w.startswith("#!/bin/sh") and sys.executable in w and "DOCKET_SHIM_NAME=aws" in w, w   # no `env python3`: the machine may have none
     assert f"_EXPECTED = {PKG_DIR!r}" in hook_source()
     # the planted hook refuses a DOCKET_PKG that is not the pinned checkout
     env = clean_env(DOCKET_RUN="1", DOCKET_PKG="/nowhere/evil", DOCKET_DIR=str(d))

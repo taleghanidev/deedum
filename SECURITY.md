@@ -45,9 +45,9 @@ of the process that makes the call.
 ## What docket changes on the machine
 
 - `docket setup --write` adds a block to `~/.zshenv` (or `~/.bashrc`) that, in coding-agent
-  shells (or every shell with `--when always`), prepends two shim folders to `PATH` (the
-  package's, and `~/.local/share/docket/bin` or `$DOCKET_BIN`, where `docket setup` / `docket
-  run` make the `ssh`, `aws`, `gh` ... symlinks), a `sitecustomize.py` to `PYTHONPATH` and
+  shells (or every shell with `--when always`), prepends one shim folder to `PATH`
+  (`~/.local/share/docket/bin` or `$DOCKET_BIN`, where `docket setup` / `docket run` write a
+  `/bin/sh` wrapper per name: `curl`, `ssh`, `aws`, `gh` ...), a `sitecustomize.py` to `PYTHONPATH` and
   `--require node_hook.cjs` to `NODE_OPTIONS`, and defines shell functions for `curl`, `ssh`,
   `aws`, `gh` and the other shimmed binaries. A shim runs the real binary with the same stdio
   and tty, forwards every signal to it and exits with its status.

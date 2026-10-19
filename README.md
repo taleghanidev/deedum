@@ -206,23 +206,31 @@ or `"auto_commit": true`). It never pushes.
 
 ## Install
 
+One line, with or without Python on the machine:
+
 ```
-pipx install docket                                            # once it is on PyPI
-pipx install git+https://github.com/taleghanidev/docket       # or straight from the repository
-docket setup --write
+curl -fsSL https://raw.githubusercontent.com/taleghanidev/docket/main/install.sh | sh
 ```
 
-Zero dependencies. Python 3.9+ (Node 18+ for the Node hook). macOS and Linux. One Python
-package: the Node hook and the curl and binary shims ship inside it, there is nothing to install
-from npm.
+It finds a Python 3.9+ or, if there is none, installs `uv` (one static binary) and lets it
+fetch a managed Python; installs docket into its own environment under `~/.local/share/docket`
+(no system Python touched, no sudo); links the `docket` command into `~/.local/bin`; and runs
+`docket setup --write`. To read the script first: `curl -fsSLO <the same URL> && sh install.sh`.
+`DOCKET_NO_SETUP=1` skips the setup step, `DOCKET_VERSION=v0.3.0` pins a tag.
+
+With a Python already there, `pipx install docket` (once on PyPI) or
+`pipx install git+https://github.com/taleghanidev/docket` do the same, then `docket setup --write`.
+
+Zero dependencies. macOS and Linux. Node 18+ for the Node hook. One package: the Node hook and
+the curl and binary shims ship inside it, there is nothing to install from npm.
 
 ## How the hooks get in
 
-`docket run` / the setup block prepend a `sitecustomize.py` to `PYTHONPATH`, two shim folders
-to `PATH` (the package's, with `curl`; and `~/.local/share/docket/bin`, or `$DOCKET_BIN`, where
-the `ssh`, `aws`, `gh` ... links are made, since a package folder may be read-only; each is a
-shell function too, so a harness that resets `PATH` still hits them) and `--require
-node_hook.cjs` to `NODE_OPTIONS`. A shimmed binary gets every signal the shim gets, and the
+`docket run` / the setup block prepend a `sitecustomize.py` to `PYTHONPATH`, one shim folder
+to `PATH` (`~/.local/share/docket/bin`, or `$DOCKET_BIN`: a small `/bin/sh` wrapper per name,
+`curl`, `ssh`, `aws`, `gh` ..., each running the shim with the interpreter docket was installed
+with, so a machine with no `python3` on PATH works; each is a shell function too, so a harness
+that resets `PATH` still hits them) and `--require node_hook.cjs` to `NODE_OPTIONS`. A shimmed binary gets every signal the shim gets, and the
 shim exits with the binary's status. Because scripts
 often set their own `PYTHONPATH`, docket also drops a tiny, environment-gated
 `docket_hook.pth` into the site-packages of the Python it runs (it prints when it does). That

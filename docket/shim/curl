@@ -8,11 +8,18 @@ if _pkg and _pkg not in sys.path:
 
 def real_curl():
     here = os.path.dirname(os.path.abspath(__file__))
+    shim_bin = os.environ.get("DOCKET_SHIM_DIR")
     for p in os.environ.get("PATH", "").split(os.pathsep):
-        if not p or os.path.abspath(p) == here:
+        if not p or os.path.abspath(p) == here or (shim_bin and os.path.realpath(p) == os.path.realpath(shim_bin)):
             continue
         c = os.path.join(p, "curl")
         if os.path.isfile(c) and os.access(c, os.X_OK):
+            try:
+                with open(c, "rb") as f:
+                    if b"# docket shim:" in f.read(200):
+                        continue   # a wrapper of ours, not curl
+            except OSError:
+                pass
             return c
     return "/usr/bin/curl"
 

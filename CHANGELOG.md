@@ -74,6 +74,8 @@ The release that makes the trail safe to keep and complete enough to trust.
   `HTTPResponse` methods; any script calling them broke under docket.
 
 ### Packaging
+- `install.sh`: one line installs docket with or without Python on the machine (`uv` brings a
+  managed Python when there is none), into `~/.local/share/docket`, no sudo, then runs setup.
 - CI on Python 3.9–3.13, macOS and Linux. `pip install -e ".[test]"` brings pytest. CONTRIBUTING,
   code of conduct, SECURITY, a gitleaks allowlist for the test fixtures.
 

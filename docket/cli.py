@@ -41,13 +41,12 @@ def _env_lines(d):
         "export DOCKET_RUN=always",
         f"export DOCKET_PKG={q(PKG_DIR)}",
         f'export PYTHONPATH={q(SHIM_DIR)}"${{PYTHONPATH:+:$PYTHONPATH}}"',
-        f'export PATH={q(BIN_DIR)}:{q(SHIM_DIR)}:"$PATH"',
+        f'export PATH={q(BIN_DIR)}:"$PATH"',
         # Node: fetch, http and https in every node process (Next.js, scripts, SDKs).
         f'export NODE_OPTIONS="--require {NODE_HOOK}${{NODE_OPTIONS:+ $NODE_OPTIONS}}"',
         # Survives a harness that resets PATH from a snapshot: one function per shim that exists
         # (made here if it can be; a function for a missing file would shadow the real binary).
-        "; ".join([f'curl() {{ {q(str(pathlib.Path(SHIM_DIR) / "curl"))} "$@"; }}'] +
-                  [f'{n}() {{ {q(str(pathlib.Path(BIN_DIR) / n))} "$@"; }}' for n in ensure_exec_shims()]),
+        "; ".join(f'{n}() {{ {q(str(pathlib.Path(BIN_DIR) / n))} "$@"; }}' for n in ensure_exec_shims()),
     ]
 
 
@@ -70,7 +69,7 @@ def cmd_setup(args):
                        "# docket: record every API call made from this machine's shells (any folder).",
                        "# ~/.zshenv, not ~/.zshrc: agent shells are non-interactive and never read .zshrc.",
                        lines[0],
-                       f'if {guard} && [ -d {shlex.quote(SHIM_DIR)} ]; then',
+                       f'if {guard} && [ -d {shlex.quote(BIN_DIR)} ]; then',
                        # Child shells inherit the exports: setting them again would stack the
                        # hooks, and inside `docket run` would overwrite that run's id.
                        '  if [ -z "$DOCKET_RUN" ]; then',
@@ -126,7 +125,7 @@ def cmd_run(args):
     if args.dry:
         env["DOCKET_DRY"] = "1"
     env["PYTHONPATH"] = SHIM_DIR + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    env["PATH"] = BIN_DIR + os.pathsep + SHIM_DIR + os.pathsep + env.get("PATH", "")
+    env["PATH"] = BIN_DIR + os.pathsep + env.get("PATH", "")
     if NODE_HOOK not in env.get("NODE_OPTIONS", ""):
         env["NODE_OPTIONS"] = f'--require "{NODE_HOOK}"' + (" " + env["NODE_OPTIONS"] if env.get("NODE_OPTIONS") else "")
     args.command = _merge_pythonpath(args.command)
@@ -137,7 +136,7 @@ def cmd_run(args):
         # `/usr/local/bin/aws ...` would skip the shim on PATH: run the shim, which runs that binary
         env["DOCKET_REAL_BIN"] = first
         args.command[idx] = os.path.basename(first)
-    if args.dry and os.path.basename(first) in EXEC_SHIMS and os.path.basename(first) not in have:
+    if args.dry and os.path.basename(first) in ["curl"] + EXEC_SHIMS and os.path.basename(first) not in have:
         # Fail closed: without its shim the real binary would run, and a dry run promised it would not.
         sys.exit(f"docket run --dry: the {os.path.basename(first)} shim could not be made in {BIN_DIR} "
                  f"(set DOCKET_BIN to a writable folder); refusing to run the real binary")
@@ -335,22 +334,32 @@ EXEC_SHIMS = ["ssh", "scp", "sftp", "rsync", "aws", "gh", "wrangler", "terraform
               "gcloud", "az", "flyctl", "fly", "vercel", "netlify", "heroku", "doctl", "stripe", "git"]
 
 
+def shim_wrapper(name):
+    """The wrapper script for one shim: runs the shim with THIS interpreter (the machine may have
+    no python3 on PATH at all; the installer's managed Python is enough), and tells the shim its
+    own name and folder so it can find the real binary past itself."""
+    src = pathlib.Path(SHIM_DIR) / ("curl" if name == "curl" else "_exec")
+    return (f"#!/bin/sh\n# docket shim: records the call, then runs the real {name}\n"
+            f"export DOCKET_SHIM_NAME={shlex.quote(name)} DOCKET_SHIM_DIR={shlex.quote(BIN_DIR)}\n"
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(src))} \"$@\"\n")
+
+
 def ensure_exec_shims():
-    """Make the per-binary symlinks to shim/_exec in BIN_DIR. Returns the names that exist."""
-    src = pathlib.Path(SHIM_DIR) / "_exec"
+    """Write the per-binary wrappers (curl and EXEC_SHIMS) into BIN_DIR. Returns the names that exist."""
     have = []
     try:
         pathlib.Path(BIN_DIR).mkdir(parents=True, exist_ok=True)
     except OSError:
         return have
-    for name in EXEC_SHIMS:
-        link = pathlib.Path(BIN_DIR) / name
+    for name in ["curl"] + EXEC_SHIMS:
+        f = pathlib.Path(BIN_DIR) / name
         try:
-            if link.is_symlink() and os.readlink(link) != str(src):
-                link.unlink()   # an older docket's shim: point it at this one
-            if not (link.is_symlink() or link.exists()):
-                link.symlink_to(src)
-            if link.exists():
+            want = shim_wrapper(name)
+            if f.is_symlink():
+                f.unlink()   # a 0.3-dev symlink
+            if not f.exists() or f.read_text() != want:
+                f.write_text(want); f.chmod(0o755)
+            if f.exists():
                 have.append(name)
         except OSError:
             pass

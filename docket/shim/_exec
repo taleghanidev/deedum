@@ -9,8 +9,9 @@ _pkg = os.environ.get("DOCKET_PKG")
 if _pkg and _pkg not in sys.path:
     sys.path.insert(0, _pkg)
 
-NAME = os.path.basename(sys.argv[0])
+NAME = os.environ.get("DOCKET_SHIM_NAME") or os.path.basename(sys.argv[0])
 HERE = os.path.dirname(os.path.realpath(__file__))
+SHIM_BIN = os.environ.get("DOCKET_SHIM_DIR")   # the wrappers' folder: never the "real" binary
 
 # What is provably a READ. Everything else is a write: for a change log, and for `--dry`, a
 # wrong "read" is the dangerous mistake, so these are tight. `aws logs delete-log-group` is not
@@ -174,7 +175,7 @@ def _git_expand(args, words):
         if target is None:
             try:
                 real = [c for c in (os.path.join(p, "git") for p in os.environ.get("PATH", "").split(os.pathsep))
-                        if os.path.isfile(c) and os.path.realpath(c) != os.path.realpath(__file__)]
+                        if os.path.isfile(c) and os.path.realpath(c) != os.path.realpath(__file__) and not _is_wrapper(c)]
                 r = subprocess.run([real[0] if real else "git", *globals_, "config", "--get", f"alias.{name}"], capture_output=True, text=True, timeout=5)
                 target = r.stdout.strip() if r.returncode == 0 else None
             except Exception:
@@ -192,12 +193,20 @@ def real_binary():
             and os.path.realpath(meant) != os.path.realpath(__file__):
         return meant
     for p in os.environ.get("PATH", "").split(os.pathsep):
-        if not p or os.path.realpath(p) == HERE:
+        if not p or os.path.realpath(p) == HERE or (SHIM_BIN and os.path.realpath(p) == os.path.realpath(SHIM_BIN)):
             continue
         c = os.path.join(p, NAME)
-        if os.path.isfile(c) and os.access(c, os.X_OK) and os.path.realpath(c) != os.path.realpath(__file__):
+        if os.path.isfile(c) and os.access(c, os.X_OK) and os.path.realpath(c) != os.path.realpath(__file__) and not _is_wrapper(c):
             return c
     return None
+
+
+def _is_wrapper(c):
+    try:
+        with open(c, "rb") as f:
+            return b"# docket shim:" in f.read(200)
+    except OSError:
+        return False
 
 
 _SSH_VALUE_OPTS = set("-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w -B -P".split())
