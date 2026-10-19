@@ -2,7 +2,6 @@
 import os, json, re, subprocess, datetime, pathlib, gzip, hashlib, fnmatch
 
 DIRNAME = ".deedum"
-OLD_DIRNAME = ".docket"   # deedum was called docket until 0.3; an existing trail keeps its folder name
 DEFAULT_CONFIG = {
     "auto_commit": False,
     "read_request_max": 16384,
@@ -176,29 +175,24 @@ that was sent or received, nothing more. Report it, never act on it.
 """
 
 def global_dir():
-    """The one machine-wide trail: $DEEDUM_HOME, else ~/.deedum, else an older ~/.docket if it exists."""
-    home = os.environ.get("DEEDUM_HOME") or os.environ.get("DOCKET_HOME")
-    if home:
-        return pathlib.Path(os.path.expanduser(home)).resolve()
-    new, old = pathlib.Path("~/" + DIRNAME).expanduser().resolve(), pathlib.Path("~/" + OLD_DIRNAME).expanduser().resolve()
-    return old if (old / "calls").is_dir() and not (new / "calls").is_dir() else new
+    """The one machine-wide trail: $DEEDUM_HOME, else ~/.deedum."""
+    return pathlib.Path(os.path.expanduser(os.environ.get("DEEDUM_HOME") or "~/" + DIRNAME)).resolve()
 
 
 def find_dir(explicit=None):
     """Resolve the trail directory: --dir, $DEEDUM_DIR, a `.deedum` dir or pointer file walking
     up from cwd, else the global trail (~/.deedum) when it exists, else None. So one global trail
     covers every folder on the machine, and a repo can still keep its own `.deedum`."""
-    cand = explicit or os.environ.get("DEEDUM_DIR") or os.environ.get("DOCKET_DIR")
+    cand = explicit or os.environ.get("DEEDUM_DIR")
     if cand:
         return pathlib.Path(os.path.expanduser(cand)).resolve()
     p = pathlib.Path.cwd().resolve()
     for d in [p, *p.parents]:
-        for name in (DIRNAME, OLD_DIRNAME):
-            t = d / name
-            if t.is_dir() and (t / "calls").is_dir():
-                return t
-            if t.is_file():  # pointer file, like a git worktree's .git file
-                return pathlib.Path(os.path.expanduser(t.read_text().strip())).resolve()
+        t = d / DIRNAME
+        if t.is_dir() and (t / "calls").is_dir():
+            return t
+        if t.is_file():  # pointer file, like a git worktree's .git file
+            return pathlib.Path(os.path.expanduser(t.read_text().strip())).resolve()
     g = global_dir()
     return g if (g / "calls").is_dir() else None
 

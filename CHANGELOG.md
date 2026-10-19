@@ -2,10 +2,10 @@
 
 ## 0.3.0 — 2026-10-19
 
-**Renamed: docket is now deedum** (the deed, the thing done). Command `deedum`, module `deedum`,
+**Renamed to deedum** (the deed, the thing done). Command `deedum`, module `deedum`,
 environment `DEEDUM_*`, trail folder `.deedum`, policy file `.deedum-policy.json`, shims in
-`~/.local/share/deedum/bin`. An existing `.docket` trail and `DOCKET_*` variables are still read,
-so nothing has to move. `deedum guide --write` puts the agent rules into a project's `AGENTS.md`, `--global` into every
+`~/.local/share/deedum/bin`. A trail made under the earlier name: rename its folder to `.deedum`
+and run `deedum setup --write <path>`. `deedum guide --write` puts the agent rules into a project's `AGENTS.md`, `--global` into every
 present agent's global instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
 `~/.gemini/GEMINI.md`); `deedum hook claude --write` merges the Claude Code hooks into
 `~/.claude/settings.json`; `deedum mcp-add` registers the MCP server with Claude Code; the
@@ -106,7 +106,7 @@ The release that makes the trail safe to keep and complete enough to trust.
   CONTRIBUTING, code of conduct, SECURITY, a gitleaks allowlist for the test fixtures.
 
 ## 0.2.0 — 2026-09-12
-Every folder, every project, Node, named secrets, dry runs.
+Every folder, every project, Node, named secrets, dry runs (under the earlier name).
 
 ## 0.1.0 — 2026-09-08
-Record every API call a command makes, payload and response, into a git-kept trail.
+Record every API call a command makes, payload and response, into a git-kept trail (under the earlier name).
