@@ -290,12 +290,13 @@ def cmd_why(args):
             return
         ti = data.get("tool_input") or {}
         text = ti.get("command") or ti.get("file_path") or ti.get("description") or json.dumps(ti)[:200]
-        from .recorder import scrub_prose, scrub_argv_list
-        try:
-            import shlex
-            text = scrub_argv_list(shlex.split(text)) if ti.get("command") else text
-        except ValueError:
-            pass
+        from .recorder import scrub_prose, scrub_argv_list, _SECRET_FLAG_IN
+        if ti.get("command") and _SECRET_FLAG_IN.search(str(text)):   # only then is the text re-quoted
+            try:
+                import shlex
+                text = scrub_argv_list(shlex.split(text))
+            except ValueError:
+                text = "<command omitted: could not parse it for redaction>"
         step = f"{data.get('tool_name', 'tool')}: {scrub_prose(' '.join(str(text).split()))[:200]}"
         store.set_session_step(d, step, key=data.get("session_id"))
         return
@@ -307,8 +308,8 @@ def cmd_why(args):
         except Exception:
             return
         prompt = " ".join(str(data.get("prompt") or "").split())
-        if not prompt or prompt.startswith("/"):
-            return
+        if not prompt or prompt.startswith(("/", "<task-notification>", "<system-reminder>", "[SYSTEM", "<command-")):
+            return   # a slash command, or a notification the harness injected: not the person's reason
         from .recorder import scrub_prose
         text = scrub_prose(prompt)
         why = "asked: " + (text[:200] + ("…" if len(text) > 200 else ""))

@@ -62,6 +62,8 @@ def test_classification():
     assert r.kind("PUT", "h", "/v1/keywords") == "write"
     assert r._graphql_kind(json.dumps({"query": "mutation { x }"})) == "write"
     assert r._graphql_kind(json.dumps({"query": "query { x }"})) == "read"
+    assert r._body_kind("Action=GetCallerIdentity&Version=2011-06-15") == "read" and r._body_kind("Action=RunInstances&Version=1") is None
+    assert r._body_kind("Action=DescribeInstances&Filter=x") == "read" and r._body_kind("Action=DeleteBucket") is None
 
 def test_curl_and_python_capture():
     base = serve(); d = trail()
@@ -465,6 +467,10 @@ def test_node_snapshot_and_agent_step():
     r = [x for x in records(d) if x["path"] == "/items/n1"][0]
     assert r["before"]["status"] == 200 and r["before"]["body"]["_json"] == {"name": "old"}, r.get("before")
     assert r["why"] == "asked: rename n1" and r["agent"]["step"] == "Bash: node rename.js --token <redacted> n1", r["agent"]
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-tool"], input=json.dumps({"session_id": "s7", "tool_name": "Bash", "tool_input": {"command": "cd ~/x && echo \"hi there\""}}), env=env, capture_output=True, text=True, cwd=ROOT)
+    assert store.get_session_state.__module__ and json.loads((d / ".state" / "why" / "s7.json").read_text())["agent"]["step"] == 'Bash: cd ~/x && echo "hi there"'   # kept as typed
+    subprocess.run([sys.executable, "-m", "deedum", "--dir", str(d), "why", "--from-claude-hook"], input=json.dumps({"session_id": "s7", "prompt": "<task-notification> <task-id>x</task-id> done"}), env=env, capture_output=True, text=True, cwd=ROOT)
+    assert json.loads((d / ".state" / "why" / "s7.json").read_text())["why"] == "asked: rename n1"   # a harness notification is not a prompt
     assert Store.items["n1"] == {"name": "new"}
     # dry run: no GET, nothing sent
     Store.gets = 0

@@ -273,7 +273,7 @@ class Recorder:
 
     def _gate(self, method, host, path, body, transport):
         kind = self.kind(method, host or "", path or "")
-        gql = self._graphql_kind(body)
+        gql = self._body_kind(body)
         if gql:
             kind = gql
         # A dry run blocks every request that is not read-only BY METHOD, whatever the path
@@ -341,6 +341,23 @@ class Recorder:
         return "write"
 
     _gql_re = re.compile(r"^\s*(mutation|query|subscription)\b", re.I)
+
+    _aws_read_re = re.compile(r"(?:^|&)Action=(Get|Describe|List|Lookup|Search|Query|Scan|BatchGet|Select|Head|Check|Validate|Simulate|Estimate|Generate\w*Report|Preview)[A-Za-z]*(?:&|$)")
+
+    def _body_kind(self, raw):
+        """A read that travels as a POST: a GraphQL query, or an AWS query-style call whose
+        Action is Get*/Describe*/List* (STS, EC2, IAM, SQS ... POST everything)."""
+        g = self._graphql_kind(raw)
+        if g:
+            return g
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "replace")
+            if isinstance(raw, str) and raw.startswith("Action=") and self._aws_read_re.search(raw[:300]):
+                return "read"
+        except Exception:
+            pass
+        return None
 
     def _graphql_kind(self, raw):
         """GraphQL sends reads and writes to one URL; look at the operation instead."""
@@ -462,7 +479,7 @@ class Recorder:
         if not store.valid_host(host) or self.ignored(host):
             return
         kind = self.kind(rec["method"], host, rec.get("path", ""))
-        gql = self._graphql_kind(rec.get("req_body"))
+        gql = self._body_kind(rec.get("req_body"))
         if gql:
             kind = gql
         if kind == "read" and any(fnmatch.fnmatch(host.lower(), p) for p in self.cfg.get("ignore_read_hosts", [])):

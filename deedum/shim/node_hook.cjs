@@ -413,7 +413,9 @@
     if (ops.length) return ops.some(([k]) => k === 'mutation') ? 'write' : 'read'
     return q.trimStart().startsWith('{') ? 'read' : null
   }
+  const AWS_READ_RE = /(?:^|&)Action=(Get|Describe|List|Lookup|Search|Query|Scan|BatchGet|Select|Head|Check|Validate|Simulate|Estimate|Generate\w*Report|Preview)[A-Za-z]*(?:&|$)/
   function gqlKind(rawBody) {
+    if (typeof rawBody === 'string' && rawBody.startsWith('Action=') && AWS_READ_RE.test(rawBody.slice(0, 300))) return 'read'
     if (typeof rawBody !== 'string' || !rawBody.slice(0, 200).includes('"query"')) return null
     try {
       const doc = JSON.parse(rawBody)
