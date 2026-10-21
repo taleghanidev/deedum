@@ -309,21 +309,28 @@
     return out
   }
   function redactObj(o, depth = 0) {
-    if (depth > 30) return o
+    // Too deep to walk: kept as scrubbed text, never verbatim (the scrub runs on parsed values now).
+    if (depth > 30) return redactJsonText(JSON.stringify(o).replace(SCRUB_RE, (_m, k) => `${k}=<redacted>`))
     if (Array.isArray(o)) return o.map((v) => redactObj(v, depth + 1))
     if (o && typeof o === 'object') {
       const out = {}
       for (const [k, v] of Object.entries(o))
-        out[k] = REDACT_B.has(k.toLowerCase()) || secretName(k) ? '<redacted>' : redactObj(v, depth + 1)
+        out[k.replace(SCRUB_RE, (_m, n) => `${n}=<redacted>`)] = REDACT_B.has(k.toLowerCase()) || secretName(k) ? '<redacted>' : redactObj(v, depth + 1)
       return out
     }
+    // A string leaf gets the key=value scrub here, after parsing: scrubbing the JSON text first
+    // could eat the backslash of an escaped quote (key=\") and leave JSON that no longer parses.
+    if (typeof o === 'string') return o.replace(SCRUB_RE, (_m, k) => `${k}=<redacted>`)
     return o
   }
   // JSON that could not be parsed (truncated): every "name": "value" pair with a credential name
   // loses its value, the pair cut by the truncation too (same as recorder.redact_json_text).
   function redactJsonText(text) {
     const pair = (m, name) => (REDACT_B.has(name.toLowerCase()) || secretName(name) ? `"${name}": "<redacted>"` : m)
-    text = text.replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.)*"/g, pair).replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.?)*$/g, pair)
+    // The cut-off string: escapes in pairs, then perhaps one lone backslash where the cut fell.
+    // Never `\\.?` inside the repeat: a backslash then matches two ways, and a 40 KB shell script
+    // sent as a body backtracked for ever (2026-10-21, foldrun library put of git_repo's run.sh).
+    text = text.replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.)*"/g, pair).replace(/"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\[\s\S])*\\?$/g, pair)
     if (text.includes('<')) {
       const el = (m, full, local, attrs) => (REDACT_B.has(local.toLowerCase()) || secretName(local) ? `<${full}${attrs || ''}><redacted></${full}>` : m)
       text = text.replace(/<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^>]*)?>([^<]{1,4000})<\/\1\s*>/g, el)
@@ -342,13 +349,13 @@
       text = buf.toString('utf8')
       if (text.includes('�')) return { _binary_bytes: buf.length }
     } else return { _stream: true }
-    text = text.replace(SCRUB_RE, (_m, k) => `${k}=<redacted>`)
     const size = text.length
     if (size <= limit * 4) {
       try {
         return { _json: redactObj(JSON.parse(text)), ...(size > limit ? { _bytes: size, _truncated_after: limit } : {}) }
       } catch {}
     }
+    text = text.replace(SCRUB_RE, (_m, k) => `${k}=<redacted>`)
     return size > limit ? { _text: redactJsonText(text.slice(0, limit)), _bytes: size, _truncated: true } : { _text: redactJsonText(text) }
   }
   function kindOf(method, host, p, rawBody) {

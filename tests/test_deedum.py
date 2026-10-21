@@ -801,6 +801,44 @@ def test_snapshot_verify_diff_undo():
     assert u.returncode == 2 and "redacted" in u.stdout and Store.items["7"]["name"] == "y", u.stdout + u.stderr
 
 
+def test_script_body_is_recorded_fast_and_parsed():
+    """2026-10-21: a 40 KB shell script PUT as JSON hung `foldrun library put` at 100% CPU for
+    ever. The key=value scrub ate the backslash of `key=\\"` so the JSON no longer parsed, and
+    the cut-string pattern `\\.?` then backtracked exponentially. Both runtimes."""
+    import shutil, time
+    line = 'v="$(awk -v key="$1" \'$1==key":" { sub(/^[^:]+:/, ""); print }\' "$f")"; echo "x\\y" '
+    script = "#!/usr/bin/env bash\n" + line * 400 + "\nsecret=hunter2abc\n"
+    payload = json.dumps({"path": "git-repo/run.sh", "content": script, "https://h/cb?token=keyleak98765": "ok"})
+    base = serve(); d = trail()
+    py = f"import urllib.request as u; u.urlopen(u.Request('{base}/api/library/tools', data={payload!r}.encode(), method='PUT', headers={{'Content-Type': 'application/json'}})).read()"
+    t = time.time(); out = run(d, sys.executable, "-c", py, why="put a script")
+    assert out.returncode == 0 and time.time() - t < 20, (out.stderr, time.time() - t)
+    if shutil.which("node"):
+        js = f"fetch('{base}/api/library/tools', {{method: 'PUT', headers: {{'content-type': 'application/json'}}, body: {json.dumps(payload)}}}).then(r => r.text()).then(() => console.log('done'))"
+        t = time.time(); out = run(d, "node", "-e", js, why="put a script")
+        assert out.returncode == 0 and "done" in out.stdout and time.time() - t < 20, (out.stderr, time.time() - t)
+    recs = [r for r in records(d) if r["path"] == "/api/library/tools"]
+    assert recs and all("_json" in r["request"]["body"] for r in recs), [list(r["request"]["body"]) for r in recs]
+    for r in recs:
+        content = r["request"]["body"]["_json"]["content"]
+        assert content.startswith("#!/usr/bin/env bash") and "secret=<redacted>" in content and "hunter2abc" not in json.dumps(r)
+        assert "keyleak98765" not in json.dumps(r), "a credential in an object KEY is scrubbed too"
+    # deeper than the walk goes: still scrubbed, never kept verbatim
+    deep = "password=deepvalue4242"
+    for _ in range(35): deep = [deep]
+    rec2 = Recorder.__new__(Recorder); rec2._redact_b = set(); rec2._scrub_re = __import__("re").compile(store.DEFAULT_CONFIG["scrub_regex"])
+    assert "deepvalue4242" not in json.dumps(rec2.redact_obj(deep))
+    if shutil.which("node"):
+        js = f"fetch('{base}/api/deep', {{method: 'PUT', headers: {{'content-type': 'application/json'}}, body: {json.dumps(json.dumps(deep))}}}).then(r => r.text()).then(() => console.log('done'))"
+        out = run(d, "node", "-e", js, why="deep"); assert "done" in out.stdout, out.stderr
+        assert "deepvalue4242" not in json.dumps([r for r in records(d) if r["path"] == "/api/deep"])
+    # the cut-string pattern is linear and still catches a value cut on a backslash
+    rec = Recorder.__new__(Recorder); rec._redact_b = {"token"}
+    t = time.time(); rec.redact_json_text('{"note": "' + 'a\\nb' * 40 + '" x')   # the old pattern doubled per escape
+    assert time.time() - t < 2
+    assert rec.redact_json_text('{"token": "abc123\\') == '{"token": "<redacted>"'
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

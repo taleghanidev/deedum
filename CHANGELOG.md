@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A request body that is JSON carrying a script (`"content": "…key=\"$1\"…"`) hung the Node
+  hook at 100% CPU for ever (`foldrun library put` of a 40 KB shell script, 2026-10-21). The
+  `key=value` scrub ran over the JSON text and ate the backslash of `key=\"`, so the body no
+  longer parsed; the cut-string pattern then backtracked exponentially (`\\.?` inside a repeat).
+  Bodies are now parsed before the scrub, which runs on each string value instead, and the
+  pattern is linear. Both runtimes.
+
 ## 0.3.0 — 2026-10-19
 
 **Renamed to deedum** (the deed, the thing done). Command `deedum`, module `deedum`,

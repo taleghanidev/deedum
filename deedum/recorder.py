@@ -396,13 +396,15 @@ class Recorder:
         return out
 
     def redact_obj(self, obj, depth=0):
-        if depth > 30:
-            return obj
+        if depth > 30:   # too deep to walk: kept as scrubbed text, never verbatim
+            return self.redact_json_text(self.scrub(json.dumps(obj)))
         if isinstance(obj, dict):
-            return {k: ("<redacted>" if str(k).lower() in self._redact_b or secret_name(k) else self.redact_obj(v, depth + 1))
+            return {(self.scrub(k) if isinstance(k, str) else k): ("<redacted>" if str(k).lower() in self._redact_b or secret_name(k) else self.redact_obj(v, depth + 1))
                     for k, v in obj.items()}
         if isinstance(obj, list):
             return [self.redact_obj(v, depth + 1) for v in obj]
+        if isinstance(obj, str):   # key=value scrub after parsing: on the JSON text it could eat an escape's backslash
+            return self.scrub(obj)
         return obj
 
     # Any header or body field whose NAME is a credential word is redacted, not just the exact
@@ -427,7 +429,9 @@ class Recorder:
         return self._scrub_re.sub(lambda m: f"{m.group(1)}=<redacted>", text)
 
     _json_pair_re = re.compile(r'"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.)*"')
-    _json_open_re = re.compile(r'"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\.?)*$')   # a string cut by truncation (maybe on a backslash)
+    # A string cut by truncation: escapes in pairs, then maybe one lone backslash where the cut fell.
+    # Never `\\.?` inside the repeat: a backslash then matches two ways and backtracking is exponential.
+    _json_open_re = re.compile(r'"([^"\\]{1,80})"\s*:\s*"(?:[^"\\]|\\[\s\S])*\\?$')
     _xml_el_re = re.compile(r"<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^>]*)?>([^<]{1,4000})</\1\s*>")   # <DeveloperToken>x</DeveloperToken>
     _xml_open_re = re.compile(r"<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^>]*)?>([^<]{1,4000})(</[^>]*)?$")   # cut inside, or inside its closing tag
 
@@ -460,13 +464,13 @@ class Recorder:
                 return {"_binary_bytes": len(raw)}
         if not isinstance(raw, str):
             raw = str(raw)
-        raw = self.scrub(raw)
         size = len(raw)
-        try:
-            return {"_json": self.redact_obj(json.loads(raw)), **({"_bytes": size, "_truncated_after": limit} if size > limit else {})} \
-                if size <= limit * 4 else {"_text": self.redact_json_text(raw[:limit]), "_bytes": size, "_truncated": True}
-        except (ValueError, TypeError):
-            pass
+        if size <= limit * 4:
+            try:   # parsed before the key=value scrub, which runs on each string value instead
+                return {"_json": self.redact_obj(json.loads(raw)), **({"_bytes": size, "_truncated_after": limit} if size > limit else {})}
+            except (ValueError, TypeError):
+                pass
+        raw = self.scrub(raw)
         if size > limit:
             return {"_text": self.redact_json_text(raw[:limit]), "_bytes": size, "_truncated": True}
         return {"_text": self.redact_json_text(raw)}
