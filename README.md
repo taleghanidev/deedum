@@ -69,7 +69,7 @@ No code changes. Hooks travel through the environment into every process a shell
 
 | Runtime | What is recorded |
 |---|---|
-| **Python** | `requests`, `httpx`, `urllib`, `urllib3` (botocore / the AWS SDK), `http.client` underneath everything (so `httplib2` and google-api-python-client: Sheets, Search Console, YouTube, Business Profile), `aiohttp`, and **gRPC** (Google Ads, Google Cloud clients) |
+| **Python** | `requests`, `httpx`, `urllib`, `urllib3` (botocore / the AWS SDK), `http.client` underneath everything (so `httplib2` and google-api-python-client: Sheets, Search Console, YouTube, Business Profile), `aiohttp`, **gRPC** (Google Ads, Google Cloud clients), and **Telethon** (a Telegram user account over MTProto: `transport: "mtproto"`, path = the TL method, `/messages.sendMessage`) |
 | **Node** | `fetch` and `http`/`https` (axios, got, the Stripe and AWS SDKs, Next.js server code) |
 | **curl** | a shim on PATH records the call (`-K` config files and `--next` segments included) and passes everything through unchanged |
 | **Binaries** | `ssh`, `scp`, `sftp`, `rsync`, `aws` (SSM included), `gh`, `wrangler`, `terraform`, `kubectl`, `helm`, `gcloud`, `az`, `flyctl`, `vercel`, `netlify`, `heroku`, `doctl`, `stripe`, `git push`, and the database and container clients `psql`, `mysql`, `mariadb`, `redis-cli`, `mongosh`, `docker`, `podman` go through a shim of the same name that records the command as a call (tool, subcommand or SQL, target host or profile, exit code, scrubbed argv) and runs the real one with the same tty, so interactive ssh and psql work unchanged. An interactive database session is recorded as opened, not what is typed into it |
@@ -111,7 +111,7 @@ One JSON object per call in `calls/YYYY-MM-DD.jsonl`:
   model named in the transcript and the folder the session was started in. `cwd` on the record
   is the folder the call itself was made from.
 - `secrets`: the credentials the call used, by name, never by value (below).
-- `status`: the HTTP status, the gRPC code, a binary's exit code, or `BLOCKED` when deedum
+- `status`: the HTTP status, the gRPC code, `OK` or the error class for MTProto, a binary's exit code, or `BLOCKED` when deedum
   refused the call.
 
 Every call carries all of it, so `deedum log --project acme-ads --secret STRIPE_SECRET_KEY

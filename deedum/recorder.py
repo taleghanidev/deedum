@@ -1,4 +1,4 @@
-"""The in-process hooks. `install()` patches requests, httpx, urllib and gRPC so every call the
+"""The in-process hooks. `install()` patches requests, httpx, urllib, gRPC and Telethon so every call the
 process makes is appended to the trail. No third-party imports at module level — the hooks attach
 lazily, only if the library is already importable."""
 import os, sys, json, time, uuid, fnmatch, re, threading, pathlib, datetime, shlex
@@ -280,7 +280,7 @@ class Recorder:
         # says: read_path_regex is a labelling heuristic (POST /v1/tokens, POST /oauth/clients
         # and POST /webhooks/status all went out under --dry until 0.3), and the gate must not
         # depend on it. A GraphQL query is the one POST that is provably a read.
-        if self.dry and method.upper() not in ("GET", "HEAD", "OPTIONS") and gql != "read" and not (transport == "grpc" and kind == "read"):
+        if self.dry and method.upper() not in ("GET", "HEAD", "OPTIONS") and gql != "read" and not (transport in ("grpc", "mtproto") and kind == "read"):
             return "deedum dry run: write not sent"
         if kind != "write" or (transport == "http" and self._auth_re.search(path or "")):
             return None
@@ -1198,6 +1198,240 @@ def _hook_grpc(rec):
     rec.cfg["rules"].append({"host": "*", "path_regex": r"^/[\w.]+/(Search|Get|List|Generate|Suggest|Query)\w*$", "kind": "read"})
     return True
 
+# ---- Telegram MTProto (Telethon) ---------------------------------------------------------------
+# A Telegram user account (not the Bot API, which is plain HTTPS) talks MTProto: Telegram's own
+# encrypted binary protocol over a raw TCP socket, so none of the HTTP hooks see it. Every call a
+# Telethon script makes goes through `UserMethods._call(sender, request)` while the request is
+# still a readable TL object, so that is where it is gated and recorded. Path = the TL method
+# name as Telegram documents it (`/messages.sendMessage`); host is fixed (the data centre is an
+# IP that changes with every migration and says nothing about the change).
+MTPROTO_HOST = "mtproto.telegram.org"
+# Reads: an explicit list of methods that only look (what Telethon scripts call to read chats,
+# people, history and files). Everything else is a write. A name is not enough: messages.
+# getBotCallbackAnswer presses a bot's button, phone.getGroupCallStreamRtmpUrl(revoke) replaces a
+# stream key, contacts.getLocated(self_expires) publishes your location, messages.readHistory
+# sends read receipts. A read missing here is refused by --dry (the safe mistake); a person can
+# mark more reads with a `rules` entry for host mtproto.telegram.org in the trail's config.json.
+_MT_READS = {
+    "messages": "getHistory getMessages getDialogs getPeerDialogs getPinnedDialogs getChats getFullChat "
+                "search searchGlobal getReplies getDiscussionMessage getUnreadMentions getUnreadReactions "
+                "getScheduledHistory getScheduledMessages getSearchCounters getSearchResultsCalendar "
+                "getSearchResultsPositions getMessageEditData getMessageReadParticipants "
+                "getMessageReactionsList getPollResults getPollVotes getExportedChatInvites getExportedChatInvite "
+                "getChatInviteImporters getAdminsWithInvites checkChatInvite getCommonChats getAllStickers "
+                "getStickerSet getStickers getCustomEmojiDocuments getAvailableReactions getWebPage "
+                "getWebPagePreview getDialogFilters getSuggestedDialogFilters getDialogUnreadMarks getOnlines "
+                "getSavedDialogs getSavedHistory getPinnedSavedDialogs getForumTopics getForumTopicsByID "
+                "getQuickReplies getQuickReplyMessages getOutboxReadDate getPeerSettings "
+                "getSplitRanges getDocumentByHash getAttachMenuBots",
+    "channels": "getChannels getFullChannel getMessages getParticipants getParticipant getAdminLog "
+                "getAdminedPublicChannels getLeftChannels getGroupsForDiscussion getInactiveChannels "
+                "getForumTopics getForumTopicsByID getSendAs getChannelRecommendations checkUsername",
+    "users": "getUsers getFullUser",
+    "contacts": "getContacts getContactIDs getStatuses resolveUsername resolvePhone search getBlocked "
+                "getTopPeers getSaved getBirthdays",
+    "updates": "getState getDifference getChannelDifference",
+    "upload": "getFile getFileHashes getCdnFile getCdnFileHashes getWebFile",
+    "photos": "getUserPhotos",
+    "help": "getConfig getNearestDc getCdnConfig getAppConfig getAppUpdate getCountriesList getPeerColors "
+            "getPeerProfileColors getTimezonesList getPremiumPromo getPromoData getTermsOfServiceUpdate "
+            "getSupportName getDeepLinkInfo getInviteText getRecentMeUrls",
+    "account": "getAuthorizations getWebAuthorizations getPrivacy getNotifySettings getAccountTTL "
+               "getGlobalPrivacySettings getContentSettings getWallPapers getThemes getDefaultEmojiStatuses "
+               "getSavedRingtones getAutoDownloadSettings getContactSignUpNotification checkUsername",
+    "stories": "getPeerStories getStoriesByID getStoriesArchive getPinnedStories getAllStories "
+               "getPeerMaxIDs getStoryViewsList getStoryReactionsList",
+    "bots": "getBotCommands getBotMenuButton",
+    "stats": "getBroadcastStats getMegagroupStats getMessageStats getStoryStats getMessagePublicForwards",
+    "payments": "getStarsStatus getStarsTransactions getPaymentReceipt getSavedInfo",
+    "langpack": "getLangPack getStrings getDifference getLanguages getLanguage",
+}
+_MT_READ_RE = r"^/(%s)$" % "|".join(
+    re.escape(f"{ns}.{m}") for ns, ms in sorted(_MT_READS.items()) for m in ms.split())
+# Sign-in and the data-centre key hand-over: credential exchanges, kept as reads with no bodies
+# (a dry run must still be able to log in and download), like an HTTP /oauth/token call.
+_MT_AUTH_RE = re.compile(r"^/(auth\.(sendCode|resendCode|signIn|checkPassword|importBotAuthorization|"
+                         r"exportAuthorization|importAuthorization|exportLoginToken|importLoginToken)|"
+                         r"account\.getPassword)$")
+# Any other method that carries a login code, a password or a session key: bodies never kept.
+_MT_SECRET_RE = re.compile(r"(?i)^/(auth\.|account\.\w*(password|authorization|session|email|phone))")
+# Wrappers Telethon (or a script) puts around the real call (InvokeWithLayer, InitConnection,
+# InvokeWithoutUpdates, InvokeAfterMsg(s), InvokeWithTakeout ... and any added later): classify,
+# redact and record the inner one. Matched by shape, not a list, so a new wrapper cannot hide a
+# sign-in from redaction.
+_MT_WRAPPER_RE = re.compile(r"^(Invoke\w*|InitConnection)Request$")
+
+
+_MT_HIDE_KEYS = ("access_hash", "file_reference", "phone_code_hash")
+
+
+def _mt_unwrap(req):
+    """The call inside any number of wrappers; None when it cannot be reached (a cycle, or
+    nesting past any real use), so the caller keeps no body at all."""
+    seen = set()
+    while _MT_WRAPPER_RE.match(type(req).__name__) and getattr(req, "query", None) is not None:
+        if id(req) in seen or len(seen) >= 64:
+            return None
+        seen.add(id(req))
+        req = req.query
+    return req
+
+
+def _mt_name(req):
+    """`telethon.tl.functions.messages.SendMessageRequest` -> `/messages.sendMessage`."""
+    cls = type(req).__name__
+    if cls.endswith("Request"):
+        cls = cls[:-7]
+    cls = cls[:1].lower() + cls[1:]
+    ns = (type(req).__module__ or "").rsplit(".", 1)[-1]
+    return f"/{ns}.{cls}" if ns and ns != "functions" else f"/{cls}"
+
+
+def _mt_plain(obj, depth=0):
+    """A TL object as JSON-able data. Bytes (file parts, keys, hashes) become their length."""
+    if depth > 12:
+        return "…"
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            obj = obj.to_dict()
+        except Exception:
+            return type(obj).__name__
+    if isinstance(obj, dict):
+        # access_hash: the per-account handle that, with a session, addresses a user or a chat
+        return {str(k): ("<redacted>" if k in _MT_HIDE_KEYS and v is not None else _mt_plain(v, depth + 1))
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_mt_plain(v, depth + 1) for v in obj[:200]]
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return f"<{len(obj)} bytes>"
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    return str(obj)[:500]
+
+
+def _mt_summary(result):
+    """A read's answer, without the content: the type and how many of each list came back
+    (message text, names and phone numbers of other people stay out of the trail)."""
+    if isinstance(result, list):
+        return [_mt_summary(r) for r in result[:50]]
+    out = {"_": type(result).__name__}
+    for k in ("messages", "users", "chats", "participants", "dialogs", "topics", "results", "updates"):
+        v = getattr(result, k, None)
+        if isinstance(v, list):
+            out[k] = len(v)
+    if isinstance(getattr(result, "count", None), int):
+        out["count"] = result.count
+    b = getattr(result, "bytes", None)
+    if isinstance(b, (bytes, bytearray)):
+        out["bytes"] = len(b)
+    return out
+
+
+def _hook_telethon(rec):
+    # Only once Telethon has finished loading `telethon.client.users`: importing it from inside
+    # the import hook while the package is half-initialised would break its circular imports.
+    users = sys.modules.get("telethon.client.users")
+    UM = getattr(users, "UserMethods", None) if users else None
+    if UM is None or not hasattr(UM, "_call"):
+        return False
+    if getattr(UM, "_deedum", False):
+        return True
+    orig_call = UM._call
+
+    def describe(r):
+        inner = _mt_unwrap(r)
+        if inner is None:
+            return r, _mt_name(r), "<redacted: wrapped too deep to inspect>", True
+        path = _mt_name(inner)
+        if _MT_SECRET_RE.search(path):
+            return inner, path, "<redacted: credential exchange>", True
+        try:
+            body = json.dumps(_mt_plain(inner), ensure_ascii=False, default=str)
+        except Exception:
+            body = type(inner).__name__
+        return inner, path, body, False
+
+    def chunk_noise(inner, path):
+        """One record per file, not per 512 KB part: only the first part of an upload or a
+        download is kept (a 3 GB upload is ~6000 calls)."""
+        if path in ("/upload.saveFilePart", "/upload.saveBigFilePart"):
+            return getattr(inner, "file_part", 0) != 0
+        if path in ("/upload.getFile", "/upload.getCdnFile", "/upload.getWebFile"):
+            return (getattr(inner, "offset", 0) or 0) != 0
+        return False
+
+    def list_like(obj):
+        u = sys.modules.get("telethon.utils")
+        f = getattr(u, "is_list_like", None)
+        if callable(f):
+            return f(obj)
+        import types
+        return isinstance(obj, (list, tuple, set, dict, range, types.GeneratorType))
+
+    async def _call(self, sender, request, *a, **kw):
+        if list_like(request):
+            # Telethon itself does list(request) (a dict gives its keys, a generator is used
+            # once): do it here, once, and hand Telethon the list so nothing is consumed twice.
+            request = list(request)
+            reqs = request
+        else:
+            reqs = [request]
+        seen = []
+        for r in reqs:
+            inner, path, body, secret = describe(r)
+            why_not = rec.gate("RPC", MTPROTO_HOST, path, None, transport="mtproto")
+            if why_not:
+                raise rec.blocked("mtproto", "RPC", MTPROTO_HOST, path, None, None, body, why_not, via="script")
+            seen.append((inner, path, body, secret))
+        t0 = time.time(); result = None; failure = None
+        try:
+            result = await orig_call(self, sender, request, *a, **kw)
+            return result
+        except BaseException as e:
+            failure = e
+            raise
+        finally:
+            ms = int((time.time() - t0) * 1000)
+            n = len(seen)
+            batch = isinstance(request, list)
+            results = list(result) if batch and isinstance(result, list) else [result] * n
+            errors = [failure] * n
+            # A batch where some failed: Telethon raises MultiError with per-request results
+            # and exceptions; the ones that went through are recorded as sent.
+            if batch and failure is not None and isinstance(getattr(failure, "results", None), list) \
+                    and isinstance(getattr(failure, "exceptions", None), list) and len(failure.results) == n:
+                results, errors = list(failure.results), list(failure.exceptions)
+            for (inner, path, body, secret), res, exc in zip(seen, results + [None] * n, errors + [None] * n):
+                status = type(exc).__name__ if exc is not None else "OK"
+                err = f"{type(exc).__name__}: {exc}"[:2000] if exc is not None else None
+                if chunk_noise(inner, path):
+                    continue
+                try:
+                    if secret:
+                        resp = "<redacted: credential exchange>"
+                    elif res is None:
+                        resp = None
+                    elif rec.kind("RPC", MTPROTO_HOST, path) == "write":
+                        resp = json.dumps(_mt_plain(res), ensure_ascii=False, default=str)
+                    else:
+                        resp = json.dumps(_mt_summary(res), ensure_ascii=False, default=str)
+                    rec.record({"transport": "mtproto", "via": "script", "method": "RPC",
+                                "host": MTPROTO_HOST, "path": path, "query": None, "req_headers": None,
+                                "req_body": body, "status": status, "resp_body": resp, "ms": ms,
+                                "error": err})
+                except Exception as e:
+                    sys.stderr.write(f"[deedum] record failed: {e}\n")
+
+    UM._call = _call
+    UM._deedum = True
+    # appended: a person's own `rules` (config.json) come first and can mark more reads
+    rules = rec.cfg.setdefault("rules", [])
+    rules.append({"host": MTPROTO_HOST, "path_regex": _MT_AUTH_RE.pattern, "kind": "read"})
+    rules.append({"host": MTPROTO_HOST, "path_regex": _MT_READ_RE, "kind": "read"})
+    return True
+
 def install(trail_dir=None, why=None):
     """Attach the hooks in this process. Safe to call twice. Returns the Recorder."""
     global _installed
@@ -1208,7 +1442,7 @@ def install(trail_dir=None, why=None):
         raise RuntimeError("deedum: no trail directory. Run `deedum init` or set DEEDUM_DIR.")
     rec = Recorder(d, why=why)
     _hook_requests(rec); _hook_httpx(rec); _hook_urllib(rec); _hook_grpc(rec); _hook_urllib3(rec)
-    _hook_http_client(rec); _hook_aiohttp(rec)
+    _hook_http_client(rec); _hook_aiohttp(rec); _hook_telethon(rec)
     # libraries imported later: hook them on import
     import builtins
     orig_import = builtins.__import__
@@ -1216,9 +1450,10 @@ def install(trail_dir=None, why=None):
         m = orig_import(name, *a, **kw)
         try:
             top = name.split(".")[0]
-            if top in ("requests", "httpx", "grpc", "urllib3", "botocore", "aiohttp"):
+            if top in ("requests", "httpx", "grpc", "urllib3", "botocore", "aiohttp", "telethon"):
                 {"requests": _hook_requests, "httpx": _hook_httpx, "grpc": _hook_grpc,
-                 "urllib3": _hook_urllib3, "botocore": _hook_urllib3, "aiohttp": _hook_aiohttp}[top](rec)
+                 "urllib3": _hook_urllib3, "botocore": _hook_urllib3, "aiohttp": _hook_aiohttp,
+                 "telethon": _hook_telethon}[top](rec)
         except Exception:
             pass
         return m

@@ -4,6 +4,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# Every `deedum run` (re)writes the shims in its bin folder to point at the interpreter running it.
+# Without this the suite rewrote the person's real ~/.local/share/deedum/bin to the test's Python,
+# and `git`, `ssh`, `gh` ... broke as soon as that (temporary) interpreter went away.
+TEST_BIN = tempfile.mkdtemp(prefix="deedum-test-bin-")
+os.environ["DEEDUM_BIN"] = TEST_BIN
+# In a shell with capture on, sitecustomize has already imported the INSTALLED deedum (with its
+# BIN_DIR fixed to the real folder): drop it so these tests import, and test, this checkout.
+for _m in [m for m in sys.modules if m == "deedum" or m.startswith("deedum.")]:
+    if not str(getattr(sys.modules[_m], "__file__", "") or "").startswith(str(ROOT)):
+        del sys.modules[_m]
 from deedum import store
 from deedum.recorder import Recorder
 
@@ -28,6 +38,7 @@ def trail():
 
 def clean_env(**kw):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("DEEDUM_", "CLAUDE", "AWS_")) and k not in ("PYTHONPATH", "NODE_OPTIONS")}
+    env["DEEDUM_BIN"] = TEST_BIN
     env.update(kw)
     return env
 
@@ -837,6 +848,185 @@ def test_script_body_is_recorded_fast_and_parsed():
     t = time.time(); rec.redact_json_text('{"note": "' + 'a\\nb' * 40 + '" x')   # the old pattern doubled per escape
     assert time.time() - t < 2
     assert rec.redact_json_text('{"token": "abc123\\') == '{"token": "<redacted>"'
+
+
+FAKE_TELETHON = {
+    "telethon/__init__.py": "from .client.telegramclient import TelegramClient\n",
+    "telethon/errors.py": (
+        "class MultiError(Exception):\n"
+        "    def __init__(self, exceptions, result, requests):\n"
+        "        super().__init__('multiple errors')\n"
+        "        self.exceptions, self.results, self.requests = list(exceptions), list(result), list(requests)\n"),
+    "telethon/client/__init__.py": "",
+    "telethon/client/telegramclient.py": "from .users import UserMethods\nclass TelegramClient(UserMethods):\n    pass\n",
+    "telethon/client/users.py": (
+        "from ..tl.tlobject import TLObject\n"
+        "class Msg(TLObject):\n    pass\n"
+        "class Messages(TLObject):\n    pass\n"
+        "class Updates(TLObject):\n    pass\n"
+        "class UserMethods:\n"
+        "    async def __call__(self, request):\n"
+        "        return await self._call(None, request)\n"
+        "    async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):\n"
+        "        if isinstance(request, (list, tuple, set, dict, range)) or hasattr(request, '__next__'):\n"
+        "            reqs = list(request)\n"
+        "            self.sent = getattr(self, 'sent', []) + [type(r).__name__ for r in reqs]\n"
+        "            res = [None if type(r).__name__ == 'DeleteMessagesRequest' else Updates(id=i, message=getattr(r, 'message', None)) for i, r in enumerate(reqs)]\n"
+        "            if None in res:\n"
+        "                from ..errors import MultiError\n"
+        "                raise MultiError([RuntimeError('MESSAGE_DELETE_FORBIDDEN') if x is None else None for x in res], res, reqs)\n"
+        "            return res\n"
+        "        self.sent = getattr(self, 'sent', []) + [type(request).__name__]\n"
+        "        n = type(request).__name__\n"
+        "        if n == 'GetHistoryRequest':\n"
+        "            return Messages(messages=[Msg(id=i, message='private student text') for i in range(3)], users=[], chats=[])\n"
+        "        if n == 'SignInRequest':\n"
+        "            return Messages(user='me', key=b'k' * 256)\n"
+        "        if n == 'DeleteMessagesRequest':\n"
+        "            raise RuntimeError('MESSAGE_DELETE_FORBIDDEN')\n"
+        "        return Updates(id=105465, message=getattr(request, 'message', None))\n"),
+    "telethon/tl/__init__.py": "",
+    "telethon/tl/tlobject.py": (
+        "class TLObject:\n"
+        "    def __init__(self, **kw):\n        self.__dict__.update(kw)\n"
+        "    def to_dict(self):\n        return dict({'_': type(self).__name__}, **self.__dict__)\n"),
+    "telethon/tl/functions/__init__.py": (
+        "from ..tlobject import TLObject\n"
+        "class InvokeWithoutUpdatesRequest(TLObject):\n    pass\n"
+        "class InvokeAfterMsgsRequest(TLObject):\n    pass\n"),
+    "telethon/tl/functions/messages.py": "".join(
+        f"from ..tlobject import TLObject\nclass {c}(TLObject):\n    pass\n" for c in
+        ("GetHistoryRequest", "SendMessageRequest", "ReadHistoryRequest", "DeleteMessagesRequest",
+         "GetBotCallbackAnswerRequest", "GetMessagesViewsRequest")),
+    "telethon/tl/functions/auth.py": "from ..tlobject import TLObject\nclass SignInRequest(TLObject):\n    pass\n",
+    "telethon/tl/functions/upload.py": "from ..tlobject import TLObject\nclass SaveFilePartRequest(TLObject):\n    pass\n",
+    "telethon/tl/functions/phone.py": "from ..tlobject import TLObject\nclass GetGroupCallStreamRtmpUrlRequest(TLObject):\n    pass\n",
+    "telethon/tl/functions/channels.py": "from ..tlobject import TLObject\nclass SearchPostsRequest(TLObject):\n    pass\n",
+    "telethon/tl/functions/contacts.py": "from ..tlobject import TLObject\nclass GetLocatedRequest(TLObject):\n    pass\n",
+}
+
+
+def fake_telethon():
+    root = pathlib.Path(tempfile.mkdtemp())
+    for rel, text in FAKE_TELETHON.items():
+        f = root / rel; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(text)
+    return root
+
+
+def test_telethon_mtproto():
+    """A Telegram user account talks MTProto over a raw socket, which no HTTP hook sees: the
+    owner's Telethon reply to a mentor recorded `0 calls` (2026-11-08). Telethon's _call is
+    hooked instead: reads by name, writes gated and kept in full, reads kept without content,
+    sign-in redacted, one record per uploaded file."""
+    root = fake_telethon()
+    py = (
+        f"import sys, asyncio; sys.path.insert(0, {str(root)!r})\n"
+        "from telethon import TelegramClient\n"
+        "from telethon.tl.functions import messages, auth, upload, InvokeWithoutUpdatesRequest\n"
+        "async def main():\n"
+        "    c = TelegramClient()\n"
+        "    await c(messages.GetHistoryRequest(peer='dornamona', limit=3))\n"
+        "    await c(auth.SignInRequest(phone_number='+61400111222', phone_code='54321'))\n"
+        "    try:\n"
+        "        await c(InvokeWithoutUpdatesRequest(query=messages.SendMessageRequest(peer='dornamona', message='hello mentor', random_id=9)))\n"
+        "        print('SENT')\n"
+        "    except PermissionError as e:\n"
+        "        print('blocked', e)\n"
+        "    for i in range(3):\n"
+        "        try: await c(upload.SaveFilePartRequest(file_id=7, file_part=i, bytes=b'x' * 10))\n"
+        "        except PermissionError: pass\n"
+        "    try: await c(messages.DeleteMessagesRequest(id=[1]))\n"
+        "    except (RuntimeError, PermissionError) as e: print('delete:', type(e).__name__)\n"
+        "    print('sent to telegram:', getattr(c, 'sent', []))\n"
+        "asyncio.run(main())\n")
+    d = trail()
+    out = run(d, sys.executable, "-c", py, why="reply to a mentor")
+    assert out.returncode == 0 and "SENT" in out.stdout, out.stdout + out.stderr
+    recs = records(d)
+    by = {r["path"]: r for r in recs}
+    assert [r["path"] for r in recs] == ["/messages.getHistory", "/auth.signIn", "/messages.sendMessage",
+                                          "/upload.saveFilePart", "/messages.deleteMessages"], [r["path"] for r in recs]
+    assert all(r["transport"] == "mtproto" and r["host"] == "mtproto.telegram.org" and r["service"] == "Telegram"
+               and r["via"] == "script" and r["why"] == "reply to a mentor" for r in recs)
+    kinds = {p: r["kind"] for p, r in by.items()}
+    assert kinds == {"/messages.getHistory": "read", "/auth.signIn": "read", "/messages.sendMessage": "write",
+                     "/upload.saveFilePart": "write", "/messages.deleteMessages": "write"}, kinds
+    # a write is kept in full, the wrapper is seen through
+    send = json.dumps(by["/messages.sendMessage"], ensure_ascii=False)
+    assert "hello mentor" in send and "105465" in send and by["/messages.sendMessage"]["status"] == "OK", send
+    # a read keeps the question, not other people's messages
+    hist = json.dumps(by["/messages.getHistory"], ensure_ascii=False)
+    assert "dornamona" in hist and "private student text" not in hist and '"messages": 3' in hist.replace('\\"', '"'), hist
+    # sign-in: no phone, no code, no key
+    sign = json.dumps(by["/auth.signIn"])
+    assert "61400111222" not in sign and "54321" not in sign and "kkkk" not in sign and "credential exchange" in sign
+    assert "<10 bytes>" in json.dumps(by["/upload.saveFilePart"]) and "xxxxxxxxxx" not in json.dumps(recs)
+    assert by["/messages.deleteMessages"]["status"] == "RuntimeError" and "MESSAGE_DELETE_FORBIDDEN" in by["/messages.deleteMessages"]["error"]
+    changes = (d / "CHANGES.md").read_text()
+    assert "/messages.sendMessage" in changes and "/messages.getHistory" not in changes and "reply to a mentor" in changes
+
+    # dry run: reads and sign-in go through, every write is refused before it leaves
+    d = trail()
+    out = run(d, sys.executable, "-c", py, why="rehearse", extra=["--dry"])
+    assert out.returncode == 0 and "blocked deedum dry run" in out.stdout and "SENT" not in out.stdout, out.stdout + out.stderr
+    assert "sent to telegram: ['GetHistoryRequest', 'SignInRequest']" in out.stdout, out.stdout
+    st = [(r["path"], r["status"]) for r in records(d)]
+    assert st[:3] == [("/messages.getHistory", "OK"), ("/auth.signIn", "OK"), ("/messages.sendMessage", "BLOCKED")], st
+    assert all(s == "BLOCKED" for p, s in st[2:]) and len([p for p, s in st if p == "/upload.saveFilePart"]) == 3, st
+
+
+def test_telethon_mtproto_review():
+    """Codex review, 2026-11-08: a bot button press and a view-count bump are `get*` but change
+    things; InvokeAfterMsgs hid a sign-in from redaction; a batch with one failure recorded every
+    request as failed; a generator of requests was used up before Telethon saw it."""
+    root = fake_telethon()
+    py = (
+        f"import sys, asyncio; sys.path.insert(0, {str(root)!r})\n"
+        "from telethon import TelegramClient\n"
+        "from telethon.errors import MultiError\n"
+        "from telethon.tl.functions import messages, auth, phone, contacts, channels, InvokeAfterMsgsRequest\n"
+        "async def main():\n"
+        "    c = TelegramClient()\n"
+        "    for r in (messages.GetBotCallbackAnswerRequest(peer='bot', msg_id=1, data=b'ok'),\n"
+        "              messages.GetMessagesViewsRequest(peer='chan', id=[1], increment=True)):\n"
+        "        try: await c(r); print('went', type(r).__name__)\n"
+        "        except PermissionError: print('refused', type(r).__name__)\n"
+        "    await c(InvokeAfterMsgsRequest(msg_ids=[1], query=auth.SignInRequest(phone_number='+61400999888', phone_code='97531')))\n"
+        "    deep = auth.SignInRequest(phone_number='+61400999888', phone_code='97531')\n"
+        "    for _ in range(70): deep = InvokeAfterMsgsRequest(msg_ids=[1], query=deep)\n"
+        "    try: await c(deep)\n"
+        "    except PermissionError: print('deep refused')\n"
+        "    for r in (phone.GetGroupCallStreamRtmpUrlRequest(peer='chan', revoke=True), contacts.GetLocatedRequest(geo_point=None, self_expires=60), channels.SearchPostsRequest(query='x', allow_paid_stars=100)):\n"
+        "        try: await c(r); print('went', type(r).__name__)\n"
+        "        except PermissionError: print('refused', type(r).__name__)\n"
+        "    try: await c([messages.SendMessageRequest(peer='a', message='batch one'), messages.DeleteMessagesRequest(id=[2])])\n"
+        "    except MultiError: print('multi')\n"
+        "    except PermissionError: print('batch refused')\n"
+        "    out = await c(r for r in [messages.GetHistoryRequest(peer='g1'), messages.GetHistoryRequest(peer='g2')])\n"
+        "    print('gen results', len(out))\n"
+        "    print('sent to telegram:', c.sent)\n"
+        "asyncio.run(main())\n")
+    d = trail()
+    out = run(d, sys.executable, "-c", py, why="review")
+    assert out.returncode == 0 and "gen results 2" in out.stdout, out.stdout + out.stderr
+    recs = records(d)
+    kinds = [(r["path"], r["kind"], r["status"]) for r in recs]
+    assert ("/messages.getBotCallbackAnswer", "write", "OK") in kinds and ("/messages.getMessagesViews", "write", "OK") in kinds, kinds
+    sign = [r for r in recs if r["path"] == "/auth.signIn"]
+    assert sign and "97531" not in json.dumps(recs) and "61400999888" not in json.dumps(recs), kinds
+    send = [r for r in recs if r["path"] == "/messages.sendMessage"]
+    dele = [r for r in recs if r["path"] == "/messages.deleteMessages"]
+    assert send and send[0]["status"] == "OK" and not send[0]["error"], send
+    assert dele and dele[0]["status"] == "RuntimeError" and "MESSAGE_DELETE_FORBIDDEN" in dele[0]["error"], dele
+    assert [r["path"] for r in recs].count("/messages.getHistory") == 2, kinds
+    d = trail()
+    out = run(d, sys.executable, "-c", py, why="review", extra=["--dry"])
+    assert "refused GetBotCallbackAnswerRequest" in out.stdout and "refused GetMessagesViewsRequest" in out.stdout, out.stdout + out.stderr
+    assert "batch refused" in out.stdout and "gen results 2" in out.stdout, out.stdout + out.stderr
+    assert "refused GetGroupCallStreamRtmpUrlRequest" in out.stdout and "refused GetLocatedRequest" in out.stdout, out.stdout
+    assert "refused SearchPostsRequest" in out.stdout, out.stdout
+    assert "deep refused" in out.stdout, out.stdout
+    assert "97531" not in json.dumps(records(d))
 
 
 if __name__ == "__main__":

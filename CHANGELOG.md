@@ -2,7 +2,32 @@
 
 ## Unreleased
 
+### Added
+- **Telegram user accounts (Telethon, MTProto).** A Telegram account does not use HTTP: it talks
+  MTProto, Telegram's encrypted binary protocol, over a raw socket, so a Telethon script recorded
+  `0 calls` (a reply sent from the owner's account, 2026-11-08). Telethon's `UserMethods._call`
+  is now hooked, before encryption: `transport: "mtproto"`, host `mtproto.telegram.org`
+  (service Telegram), path the TL method (`/messages.sendMessage`),
+  wrappers such as `InvokeWithoutUpdatesRequest` seen through at any depth. Reads are an explicit
+  list of methods that only look (history, dialogs, users, contacts, participants, files, ...);
+  everything else is a write, because names lie (`getBotCallbackAnswer` presses a bot button,
+  `getGroupCallStreamRtmpUrl(revoke)` replaces a stream key, `channels.searchPosts` can spend
+  Stars, `readHistory` sends read receipts). A person's own `rules` come first and can mark more
+  reads. `--dry` refuses writes
+  before they leave. Writes keep the request and the answer; reads keep the request and only a
+  summary of the answer (type and counts, never other people's messages). Sign-in and the
+  data-centre key hand-over are credential exchanges (reads, no bodies, so a dry run can still log
+  in and download); any other `auth.*` or password/session call keeps no bodies; `access_hash`,
+  `file_reference` and `phone_code_hash` are redacted, bytes become their length; an upload or a
+  download is one record per file, not per 512 KB part (every part is still gated). A batch is
+  recorded per request (with `MultiError`, the ones that went through are `OK`); a dict, set or
+  generator of requests is taken the way Telethon takes it. Python only:
+  GramJS (Node) and Pyrogram are not hooked yet.
+
 ### Fixed
+- The test suite rewrote the person's real shims (`~/.local/share/deedum/bin`) to point at the
+  Python running the tests; run from a temporary environment (`uv run --with pytest`), every
+  shimmed `git`, `ssh`, `gh` ... failed once it was gone. The tests use their own bin folder.
 - A request body that is JSON carrying a script (`"content": "…key=\"$1\"…"`) hung the Node
   hook at 100% CPU for ever (a CLI upload of a 40 KB shell script, 2026-10-21). The
   `key=value` scrub ran over the JSON text and ate the backslash of `key=\"`, so the body no
